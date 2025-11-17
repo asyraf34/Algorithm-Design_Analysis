@@ -7,7 +7,8 @@
 
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
-
+import math
+import heapq
 
 def pretty_print_map_summary(map_payload: Dict[str, Any]) -> None:
     extent = map_payload.get("extent") or [None, None, None, None]
