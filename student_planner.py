@@ -16,6 +16,7 @@ def pretty_print_map_summary(map_payload: Dict[str, Any]) -> None:
     slots = map_payload.get("slots") or []
     occupied = map_payload.get("occupied_idx") or []
     free_slots = len(slots) - sum(1 for v in occupied if v)
+    print("[debug] test hybrid A* path planning")
     print("[algo] map extent :", extent)
     print("[algo] total slots:", len(slots), "/ free:", free_slots)
     stationary = map_payload.get("grid", {}).get("stationary")
@@ -285,9 +286,10 @@ class PlannerSkeleton:
     def compute_path(self, obs: Dict[str, Any]) -> None:
         """관측과 맵을 이용해 경로(웨이포인트)를 준비합니다."""
         self.waypoints.clear()
-
+        
         if self.map_data is None or self.stationary_grid is None:
             print("[algo] compute_path: no map yet")
+            print("[debug] test hybrid A* path planning")
             return
 
         state = obs.get("state", {})
@@ -332,7 +334,6 @@ class PlannerSkeleton:
 
         return cmd
 
-
 # 전역 planner 인스턴스 (통신 모듈이 이 객체를 사용합니다.)
 planner = PlannerSkeleton()
 
@@ -351,4 +352,10 @@ def planner_step(obs: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as exc:
         print(f"[algo] planner_step error: {exc}")
         return {"steer": 0.0, "accel": 0.0, "brake": 0.5, "gear": "D"}
+    
+    
+
+    
+
+
 
