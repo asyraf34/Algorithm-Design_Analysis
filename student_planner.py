@@ -36,7 +36,7 @@ class PlannerSkeleton:
     stationary_grid: Optional[List[List[float]]] = None
     waypoints: List[Tuple[float, float]] = None
 
-    # 차량 파라미터 (필요시 수정)
+    # 차량 파라미터
     wheel_base: float = 2.5
     car_radius: float = 1.5              # 간단한 충돌 체크용 반지름
     max_steer: float = math.radians(35)  # 최대 조향각
