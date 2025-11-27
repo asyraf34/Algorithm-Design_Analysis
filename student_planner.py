@@ -126,7 +126,22 @@ class PlannerSkeleton:
         half_len = max(span_x, span_y) / 2.0
         start_to_goal = (start[0] - goal[0], start[1] - goal[1])
         direction = 1.0 if start_to_goal[0] * axis[0] + start_to_goal[1] * axis[1] >= 0 else -1.0
+        # Increase the entry offset for slots that sit along the outermost rows.
+        # When the target is tight against the top/bottom (or left/right) edge,
+        # the vehicle used to cut in too early and scrape nearby obstacles.
+        # Expanding the offset forces the car to drive deeper into the lane
+        # before turning toward the slot, mirroring the safer behaviour seen on
+        # middle rows.
+        min_x, max_x, min_y, max_y = self.map_extent or (0.0, 0.0, 0.0, 0.0)
+        if span_x >= span_y:
+            dist_to_edge = min(abs(goal[0] - min_x), abs(max_x - goal[0]))
+        else:
+            dist_to_edge = min(abs(goal[1] - min_y), abs(max_y - goal[1]))
+
         approach_margin = max(self.cell_size * 2.0, 1.5)
+        edge_buffer = max(self.cell_size * 6.0, 3.0)
+        if dist_to_edge < edge_buffer:
+            approach_margin = max(approach_margin, edge_buffer)
         entry_point = (
             goal[0] + axis[0] * direction * (half_len + approach_margin),
             goal[1] + axis[1] * direction * (half_len + approach_margin),
