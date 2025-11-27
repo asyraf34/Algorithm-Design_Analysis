@@ -126,6 +126,18 @@ class PlannerSkeleton:
         half_len = max(span_x, span_y) / 2.0
         start_to_goal = (start[0] - goal[0], start[1] - goal[1])
         direction = 1.0 if start_to_goal[0] * axis[0] + start_to_goal[1] * axis[1] >= 0 else -1.0
+        # Encourage an earlier turn-in by defining a trigger point that lies along
+        # the lane when the vehicle's nose lines up with the midpoint of the slot
+        # opening. The car should begin steering once it reaches this alignment so
+        # it can arc smoothly into the space instead of overshooting and clipping
+        # nearby obstacles.
+
+        turn_in_offset = max(half_len * 0.5, self.cell_size)
+        turn_in_point = (
+            goal[0] + axis[0] * direction * turn_in_offset,
+            goal[1] + axis[1] * direction * turn_in_offset,
+        )
+
         # Increase the entry offset for slots that sit along the outermost rows.
         # When the target is tight against the top/bottom (or left/right) edge,
         # the vehicle used to cut in too early and scrape nearby obstacles.
@@ -172,6 +184,7 @@ class PlannerSkeleton:
         start_idx = world_to_grid(start)
         goal_idx = world_to_grid(goal)
         entry_idx = world_to_grid(entry_point)
+        turn_in_idx = world_to_grid(turn_in_point)
 
         def nearest_free(idx: Tuple[int, int]) -> Optional[Tuple[int, int]]:
             if not in_bounds(idx):
@@ -248,6 +261,7 @@ class PlannerSkeleton:
         start_free = nearest_free(start_idx)
         entry_free = nearest_free(entry_idx)
         goal_free = nearest_free(goal_idx)
+        turn_in_free = nearest_free(turn_in_idx)
 
         if start_free is None or goal_free is None:
             print(
@@ -256,20 +270,33 @@ class PlannerSkeleton:
             self.waypoints = [goal]
             return
 
-        # First try to navigate toward the entry point to line up the approach,
-        # then proceed into the slot. If the entry cell is blocked, fall back to
-        # the direct goal.
+        # First try to navigate toward the turn-in trigger so steering can begin
+        # when the car nose aligns with the slot midpoint. Proceed from there to
+        # the entry point, then into the slot. If any intermediate waypoint is
+        # blocked, gracefully fall back to the remaining reachable targets.
         path_idx: List[Tuple[int, int]] = []
+        current_start = start_free
+        if turn_in_free is not None:
+            path_to_turn_in = a_star(start_free, turn_in_free)
+            if path_to_turn_in:
+                path_idx.extend(path_to_turn_in)
+                current_start = turn_in_free
+
         if entry_free is not None:
-            path_to_entry = a_star(start_free, entry_free)
+            path_to_entry = a_star(current_start, entry_free)
             if path_to_entry:
-                path_idx.extend(path_to_entry)
-                if goal_free != entry_free:
-                    path_from_entry = a_star(entry_free, goal_free)
-                    if path_from_entry:
-                        # Drop the first cell to avoid duplication where the two
-                        # paths meet.
-                        path_idx.extend(path_from_entry[1:])
+                # Drop the first cell to avoid duplication where the two paths
+                # meet.
+                if path_idx and path_to_entry:
+                    path_idx.extend(path_to_entry[1:])
+                else:
+                    path_idx.extend(path_to_entry)
+                current_start = entry_free
+
+        if current_start is not None and goal_free is not None and current_start != goal_free:
+            path_from_entry = a_star(current_start, goal_free)
+            if path_from_entry:
+                path_idx.extend(path_from_entry[1:] if path_idx else path_from_entry)
 
         if not path_idx:
             path_idx = a_star(start_free, goal_free)
