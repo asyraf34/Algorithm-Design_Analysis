@@ -73,6 +73,26 @@ class PlannerSkeleton:
             if idx < len(slots) and is_occ:
                 mark_rectangle(tuple(slots[idx]))
 
+       # Treat map borders and painted lines as hard obstacles so that the planner
+        # never clips through them. Some maps only encode these as rectangles/lines
+        # outside the stationary grid, so we explicitly rasterize them into the
+        # occupancy grid here.
+        for wall in map_payload.get("walls_rects", []) or []:
+            mark_rectangle(tuple(wall))
+
+        line_thickness = max(self.cell_size * 0.5, 0.2)
+        for line in map_payload.get("lines", []) or []:
+            if len(line) != 4:
+                continue
+            x0, y0, x1, y1 = map(float, line)
+            rect = (
+                min(x0, x1) - line_thickness,
+                max(x0, x1) + line_thickness,
+                min(y0, y1) - line_thickness,
+                max(y0, y1) + line_thickness,
+            )
+            mark_rectangle(rect)
+            
         pretty_print_map_summary(map_payload)
         self.waypoints.clear()
 
@@ -96,6 +116,22 @@ class PlannerSkeleton:
         goal_slot = self.cached_target
         goal = ((goal_slot[0] + goal_slot[1]) / 2.0, (goal_slot[2] + goal_slot[3]) / 2.0)
 
+        # Create an intermediate entry waypoint that sits just outside the parking
+        # slot along its longitudinal axis. This encourages the car to begin
+        # turning earlier so it approaches the target space with the correct
+        # alignment instead of diving in late.
+        span_x = abs(goal_slot[1] - goal_slot[0])
+        span_y = abs(goal_slot[3] - goal_slot[2])
+        axis = (1.0, 0.0) if span_x >= span_y else (0.0, 1.0)
+        half_len = max(span_x, span_y) / 2.0
+        start_to_goal = (start[0] - goal[0], start[1] - goal[1])
+        direction = 1.0 if start_to_goal[0] * axis[0] + start_to_goal[1] * axis[1] >= 0 else -1.0
+        approach_margin = max(self.cell_size * 2.0, 1.5)
+        entry_point = (
+            goal[0] + axis[0] * direction * (half_len + approach_margin),
+            goal[1] + axis[1] * direction * (half_len + approach_margin),
+        )
+
         def world_to_grid(pt: Tuple[float, float]) -> Tuple[int, int]:
             min_x, max_x, min_y, max_y = self.map_extent or (0, 0, 0, 0)
             gx = int((pt[0] - min_x) / self.cell_size)
@@ -110,6 +146,7 @@ class PlannerSkeleton:
 
         start_idx = world_to_grid(start)
         goal_idx = world_to_grid(goal)
+        entry_idx = world_to_grid(entry_point)
 
         grid_rows = len(self.stationary_grid)
         grid_cols = len(self.stationary_grid[0]) if grid_rows else 0
@@ -187,6 +224,7 @@ class PlannerSkeleton:
             return path
 
         start_free = nearest_free(start_idx)
+        entry_free = nearest_free(entry_idx)
         goal_free = nearest_free(goal_idx)
 
         if start_free is None or goal_free is None:
@@ -196,7 +234,23 @@ class PlannerSkeleton:
             self.waypoints = [goal]
             return
 
-        path_idx = a_star(start_free, goal_free)
+        # First try to navigate toward the entry point to line up the approach,
+        # then proceed into the slot. If the entry cell is blocked, fall back to
+        # the direct goal.
+        path_idx: List[Tuple[int, int]] = []
+        if entry_free is not None:
+            path_to_entry = a_star(start_free, entry_free)
+            if path_to_entry:
+                path_idx.extend(path_to_entry)
+                if goal_free != entry_free:
+                    path_from_entry = a_star(entry_free, goal_free)
+                    if path_from_entry:
+                        # Drop the first cell to avoid duplication where the two
+                        # paths meet.
+                        path_idx.extend(path_from_entry[1:])
+
+        if not path_idx:
+            path_idx = a_star(start_free, goal_free)
         if not path_idx:
             print(
                 f"[algo] A* failed to find path start={start_free} goal={goal_free}; using direct goal"
@@ -238,7 +292,8 @@ class PlannerSkeleton:
         # Use a simple lookahead to smooth steering. Selecting a waypoint that is a bit
         # farther ahead helps the vehicle avoid scraping along borders when entering
         # tight parking slots.
-        lookahead_dist = max(self.cell_size * 2.5, 1.0)
+        distance_to_goal = math.hypot(self.waypoints[-1][0] - x, self.waypoints[-1][1] - y)
+        lookahead_dist = max(self.cell_size * 1.5, min(self.cell_size * 3.0, distance_to_goal * 0.6))
         target_wp = self.waypoints[0]
         for wp in self.waypoints:
             if math.hypot(wp[0] - x, wp[1] - y) >= lookahead_dist:
@@ -256,7 +311,6 @@ class PlannerSkeleton:
         steer_gain = 1.2
         cmd["steer"] = max(-max_steer, min(max_steer, steer_gain * heading_error))
 
-        distance_to_goal = math.hypot(self.waypoints[-1][0] - x, self.waypoints[-1][1] - y)
         target_speed = 1.5 if distance_to_goal > 3.0 else 0.5
 
         if v < target_speed:
