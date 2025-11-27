@@ -35,6 +35,8 @@ class PlannerSkeleton:
     stationary_grid: Optional[List[List[float]]] = None
     waypoints: List[Tuple[float, float]] = None
     cached_target: Optional[Tuple[float, float, float, float]] = None
+    turn_in_point: Optional[Tuple[float, float]] = None
+    turn_in_triggered: bool = False
 
     def __post_init__(self) -> None:
         if self.waypoints is None:
@@ -53,6 +55,8 @@ class PlannerSkeleton:
         occupied_idx = map_payload.get("occupied_idx") or []
         slots = map_payload.get("slots") or []
         self.cached_target = None
+        self.turn_in_point = None
+        self.turn_in_triggered = False
 
         def mark_rectangle(rect: Tuple[float, float, float, float]) -> None:
             if not self.stationary_grid:
@@ -112,6 +116,9 @@ class PlannerSkeleton:
         elif not self.cached_target:
             return
 
+        # Reset the turn-in trigger for a new planning cycle.
+        self.turn_in_triggered = False
+
         start = (float(obs.get("state", {}).get("x", 0.0)), float(obs.get("state", {}).get("y", 0.0)))
         goal_slot = self.cached_target
         goal = ((goal_slot[0] + goal_slot[1]) / 2.0, (goal_slot[2] + goal_slot[3]) / 2.0)
@@ -152,13 +159,13 @@ class PlannerSkeleton:
             goal[0] + axis[0] * direction * (half_len + approach_margin),
             goal[1] + axis[1] * direction * (half_len + approach_margin),
         )
-        # Place the turn-in trigger at least two grid cells before the entry
-        # point so it does not collapse onto the same waypoint after obstacle
-        # inflation snaps both to the same free cell. A distinct trigger ensures
-        # the controller begins steering before reaching the slot mouth.
+        # Place the turn-in trigger further upstream of the entry point so the
+        # steering arc begins earlier. Keeping at least ~3 cells of clearance
+        # ahead of the slot mouth gives the vehicle enough room to swing into
+        # the target bay without overshooting.
         turn_in_offset = max(
             half_len + 0.5 * self.cell_size,
-            (half_len + approach_margin) - self.cell_size * 2.0,
+            (half_len + approach_margin) - self.cell_size * 3.0,
         )
         turn_in_point = (
             goal[0] + axis[0] * direction * turn_in_offset,
@@ -287,7 +294,14 @@ class PlannerSkeleton:
                 if candidate_free is not None and candidate_free != entry_free:
                     turn_in_free = candidate_free
                     break
-                
+
+        # Track the actual turn-in waypoint (post snapping) for debug logging
+        # inside the controller loop.
+        if turn_in_free is not None:
+            self.turn_in_point = grid_to_world(turn_in_free)
+        else:
+            self.turn_in_point = turn_in_point
+
         if start_free is None or goal_free is None:
             print(
                 f"[algo] no free cell for start/goal (start={start_idx}, goal={goal_idx})"
@@ -356,6 +370,20 @@ class PlannerSkeleton:
 
         # Remove visited waypoints
         waypoint_reached_threshold = max(self.cell_size * 0.8, 0.4)
+        if self.turn_in_point is not None and not self.turn_in_triggered:
+            distance_to_trigger = math.hypot(
+                self.turn_in_point[0] - x, self.turn_in_point[1] - y
+            )
+            trigger_radius = max(waypoint_reached_threshold * 1.2, self.cell_size)
+            if distance_to_trigger <= trigger_radius:
+                self.turn_in_triggered = True
+                print(
+                    (
+                        "[algo] turn-in trigger reached at "
+                        f"({self.turn_in_point[0]:.2f}, {self.turn_in_point[1]:.2f}) "
+                        f"t={obs.get('t', 0.0):.2f} remaining_wps={len(self.waypoints)}"
+                    )
+                )
         while self.waypoints and math.hypot(self.waypoints[0][0] - x, self.waypoints[0][1] - y) < waypoint_reached_threshold:
             self.waypoints.pop(0)
 
