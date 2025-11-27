@@ -235,7 +235,16 @@ class PlannerSkeleton:
             cmd["brake"] = 0.5
             return cmd
 
+        # Use a simple lookahead to smooth steering. Selecting a waypoint that is a bit
+        # farther ahead helps the vehicle avoid scraping along borders when entering
+        # tight parking slots.
+        lookahead_dist = max(self.cell_size * 2.5, 1.0)
         target_wp = self.waypoints[0]
+        for wp in self.waypoints:
+            if math.hypot(wp[0] - x, wp[1] - y) >= lookahead_dist:
+                target_wp = wp
+                break
+
         dx = target_wp[0] - x
         dy = target_wp[1] - y
         heading_error = math.atan2(dy, dx) - yaw
@@ -263,7 +272,7 @@ class PlannerSkeleton:
 
         return cmd
 
-    def inflate_obstacles(self, radius_m: float = 1.0) -> None:
+    def inflate_obstacles(self, radius_m: float = 1.5) -> None:
         """단순 팽창으로 차량 폭을 고려한 안전 여유를 확보합니다."""
 
         if not self.stationary_grid:
