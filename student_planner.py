@@ -126,17 +126,17 @@ class PlannerSkeleton:
         half_len = max(span_x, span_y) / 2.0
         start_to_goal = (start[0] - goal[0], start[1] - goal[1])
         direction = 1.0 if start_to_goal[0] * axis[0] + start_to_goal[1] * axis[1] >= 0 else -1.0
-        # Encourage an earlier turn-in by defining a trigger point that lies along
-        # the lane when the vehicle's nose lines up with the midpoint of the slot
-        # opening. The car should begin steering once it reaches this alignment so
-        # it can arc smoothly into the space instead of overshooting and clipping
-        # nearby obstacles.
 
-        turn_in_offset = max(half_len * 0.5, self.cell_size)
-        turn_in_point = (
-            goal[0] + axis[0] * direction * turn_in_offset,
-            goal[1] + axis[1] * direction * turn_in_offset,
-        )
+        # Encourage an earlier turn-in by defining a trigger point that lines up
+        # with the midpoint of the grid cell immediately before the slot
+        # entrance. Starting the steering arc just ahead of the slot opening
+        # helps the vehicle sweep into the space without clipping obstacles.
+
+        min_x, max_x, min_y, max_y = self.map_extent or (0.0, 0.0, 0.0, 0.0)
+        if span_x >= span_y:
+            dist_to_edge = min(abs(goal[0] - min_x), abs(max_x - goal[0]))
+        else:
+            dist_to_edge = min(abs(goal[1] - min_y), abs(max_y - goal[1]))
 
         # Increase the entry offset for slots that sit along the outermost rows.
         # When the target is tight against the top/bottom (or left/right) edge,
@@ -144,12 +144,6 @@ class PlannerSkeleton:
         # Expanding the offset forces the car to drive deeper into the lane
         # before turning toward the slot, mirroring the safer behaviour seen on
         # middle rows.
-        min_x, max_x, min_y, max_y = self.map_extent or (0.0, 0.0, 0.0, 0.0)
-        if span_x >= span_y:
-            dist_to_edge = min(abs(goal[0] - min_x), abs(max_x - goal[0]))
-        else:
-            dist_to_edge = min(abs(goal[1] - min_y), abs(max_y - goal[1]))
-
         approach_margin = max(self.cell_size * 2.0, 1.5)
         edge_buffer = max(self.cell_size * 6.0, 3.0)
         if dist_to_edge < edge_buffer:
@@ -157,6 +151,18 @@ class PlannerSkeleton:
         entry_point = (
             goal[0] + axis[0] * direction * (half_len + approach_margin),
             goal[1] + axis[1] * direction * (half_len + approach_margin),
+        )
+        # Place the turn-in trigger at least two grid cells before the entry
+        # point so it does not collapse onto the same waypoint after obstacle
+        # inflation snaps both to the same free cell. A distinct trigger ensures
+        # the controller begins steering before reaching the slot mouth.
+        turn_in_offset = max(
+            half_len + 0.5 * self.cell_size,
+            (half_len + approach_margin) - self.cell_size * 2.0,
+        )
+        turn_in_point = (
+            goal[0] + axis[0] * direction * turn_in_offset,
+            goal[1] + axis[1] * direction * turn_in_offset,
         )
 
         grid_rows = len(self.stationary_grid)
@@ -263,6 +269,25 @@ class PlannerSkeleton:
         goal_free = nearest_free(goal_idx)
         turn_in_free = nearest_free(turn_in_idx)
 
+        # If the turn-in trigger snaps onto the same free cell as the entry
+        # point after inflation and snapping, back it up along the lane until we
+        # recover a distinct steering cue.
+        if (
+            turn_in_free is not None
+            and entry_free is not None
+            and turn_in_free == entry_free
+        ):
+            max_shift_cells = max(1, int(math.ceil(1.0 / self.cell_size)))
+            for step in range(1, max_shift_cells + 3):
+                candidate_point = (
+                    turn_in_point[0] - axis[0] * direction * self.cell_size * step,
+                    turn_in_point[1] - axis[1] * direction * self.cell_size * step,
+                )
+                candidate_free = nearest_free(world_to_grid(candidate_point))
+                if candidate_free is not None and candidate_free != entry_free:
+                    turn_in_free = candidate_free
+                    break
+                
         if start_free is None or goal_free is None:
             print(
                 f"[algo] no free cell for start/goal (start={start_idx}, goal={goal_idx})"
