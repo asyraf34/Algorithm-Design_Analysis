@@ -73,7 +73,7 @@ class PlannerSkeleton:
             if idx < len(slots) and is_occ:
                 mark_rectangle(tuple(slots[idx]))
 
-       # Treat map borders and painted lines as hard obstacles so that the planner
+        # Treat map borders and painted lines as hard obstacles so that the planner
         # never clips through them. Some maps only encode these as rectangles/lines
         # outside the stationary grid, so we explicitly rasterize them into the
         # occupancy grid here.
@@ -132,10 +132,20 @@ class PlannerSkeleton:
             goal[1] + axis[1] * direction * (half_len + approach_margin),
         )
 
+        grid_rows = len(self.stationary_grid)
+        grid_cols = len(self.stationary_grid[0]) if grid_rows else 0
+
+        if grid_rows == 0 or grid_cols == 0:
+            print("[algo] stationary grid empty; falling back to direct goal")
+            self.waypoints = [goal]
+            return
+        
         def world_to_grid(pt: Tuple[float, float]) -> Tuple[int, int]:
             min_x, max_x, min_y, max_y = self.map_extent or (0, 0, 0, 0)
             gx = int((pt[0] - min_x) / self.cell_size)
             gy = int((pt[1] - min_y) / self.cell_size)
+            gx = max(0, min(grid_cols - 1, gx))
+            gy = max(0, min(grid_rows - 1, gy))
             return gx, gy
 
         def grid_to_world(idx: Tuple[int, int]) -> Tuple[float, float]:
@@ -147,9 +157,6 @@ class PlannerSkeleton:
         start_idx = world_to_grid(start)
         goal_idx = world_to_grid(goal)
         entry_idx = world_to_grid(entry_point)
-
-        grid_rows = len(self.stationary_grid)
-        grid_cols = len(self.stationary_grid[0]) if grid_rows else 0
 
         def nearest_free(idx: Tuple[int, int]) -> Optional[Tuple[int, int]]:
             if not in_bounds(idx):
