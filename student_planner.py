@@ -178,21 +178,21 @@ class PlannerSkeleton:
         cy = (y0 + y1) / 2.0
         width = abs(x1 - x0)
         height = abs(y1 - y0)
-        probe_dist = 1.5 
+        probe_dist = 2.0 
         base_yaw = 0.0
         
         if width > height:
-            left_blocked = any(self.is_obstacle_at(x0 - i/30, cy) for i in range(0, int(probe_dist*30)))
-            right_blocked = any(self.is_obstacle_at(x1 + i/30, cy) for i in range(0, int(probe_dist*30)))
+            left_blocked = any(self.is_obstacle_at(x0 - i/40, cy) for i in range(-10, int(probe_dist*40)))
+            right_blocked = any(self.is_obstacle_at(x1 + i/40, cy) for i in range(-10, int(probe_dist*40)))
             if left_blocked and not right_blocked: base_yaw = math.pi
             elif not left_blocked and right_blocked: base_yaw = 0.0
             else: base_yaw = 0.0
         else:
-            bottom_blocked = any(self.is_obstacle_at(cx, y0 - i/30) for i in range(0, int(probe_dist*30)))
-            top_blocked = any(self.is_obstacle_at(cx, y1 + i/30) for i in range(0, int(probe_dist*30)))
+            bottom_blocked = any(self.is_obstacle_at(cx, y0 - i/40) for i in range(-10, int(probe_dist*40)))
+            top_blocked = any(self.is_obstacle_at(cx, y1 + i/40) for i in range(-10, int(probe_dist*40)))
             if bottom_blocked and not top_blocked: base_yaw = -math.pi / 2.0
             elif not bottom_blocked and top_blocked: base_yaw = math.pi / 2.0
-            else: base_yaw = math.pi / 2.0
+            else: base_yaw = -math.pi / 2.0
 
         final_yaw = base_yaw
         if hasattr(self, 'expected_orientation') and self.expected_orientation == 'rear_in':
@@ -274,7 +274,7 @@ class PlannerSkeleton:
         visited[self.get_grid_index(start_node.x, start_node.y, start_node.yaw)] = 0.0
 
         step_size = 0.8
-        max_iter = 3000
+        max_iter = 2000
         wheelbase = 2.5
         
         simulated_max_steer = 0.6*1.1
@@ -285,7 +285,7 @@ class PlannerSkeleton:
         closest_node = start_node
         min_dist_to_goal = float('inf')
         start_time = time.time()
-        time_limit = 0.2 
+        time_limit = 0.1
 
         while open_list:
             if time.time() - start_time > time_limit:
@@ -325,9 +325,9 @@ class PlannerSkeleton:
                     if self.is_collision(next_x, next_y): continue
 
                     # 비용 함수
-                    steer_cost = abs(steer) * 0.1
+                    steer_cost = abs(steer) * 0.9999
                     switch_cost = 100.0 if current.direction != d else 0.0
-                    rev_cost = 0.1 if d == -1 else 0.0
+                    rev_cost = 0.11 if d == -1 else 0.0
                     new_g = current.g + step_size + steer_cost + switch_cost + rev_cost
                     
                     # 휴리스틱 강화 (목표 지향적)
@@ -429,7 +429,7 @@ class PlannerSkeleton:
             fx, fy, _ = self.get_final_pose(self.cached_target)
             dist_to_goal = math.hypot(fx - x, fy - y)
 
-            if self.planning_mode == "APPROACH" and dist_to_goal < 8.0:
+            if self.planning_mode == "APPROACH" and dist_to_goal < 9.0:
                 print(f"[algo] Switching to PARKING mode.")
                 self.planning_mode = "PARKING"
                 self.waypoints = [] 
@@ -567,7 +567,7 @@ class PlannerSkeleton:
                 target_speed = 0.3
             if total_dist < 0.5:
                 target_speed = 0.15   
-        elif dist_to_goal > 12:
+        elif dist_to_goal > 14:
             target_speed = 5.0
         else:
             target_speed = 2.0
