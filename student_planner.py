@@ -99,7 +99,7 @@ class PlannerSkeleton:
         self.waypoints.clear()
 
         self.planning_mode = "APPROACH"
-        self.inflate_obstacles(0.5)
+        self.inflate_obstacles(0)
     
     def normalize_angle(self, angle: float) -> float:
         while angle > math.pi: angle -= 2.0 * math.pi
@@ -107,7 +107,7 @@ class PlannerSkeleton:
         return angle
 
     def get_grid_index(self, x: float, y: float, yaw: float) -> Tuple[int, int, int]:
-        return (int(round(x)), int(round(y)), int(round(yaw / 0.26)))
+        return (int(round(x)), int(round(y)), int(round(yaw / 0.07)))
 
     def is_collision(self, x: float, y: float) -> bool:
         if not self.stationary_grid: return False
@@ -182,14 +182,14 @@ class PlannerSkeleton:
         base_yaw = 0.0
         
         if width > height:
-            left_blocked = any(self.is_obstacle_at(x0 - i/10, cy) for i in range(0, int(probe_dist*10)))
-            right_blocked = any(self.is_obstacle_at(x1 + i/10, cy) for i in range(0, int(probe_dist*10)))
+            left_blocked = any(self.is_obstacle_at(x0 - i/30, cy) for i in range(0, int(probe_dist*30)))
+            right_blocked = any(self.is_obstacle_at(x1 + i/30, cy) for i in range(0, int(probe_dist*30)))
             if left_blocked and not right_blocked: base_yaw = math.pi
             elif not left_blocked and right_blocked: base_yaw = 0.0
             else: base_yaw = 0.0
         else:
-            bottom_blocked = any(self.is_obstacle_at(cx, y0 - i/10) for i in range(0, int(probe_dist*10)))
-            top_blocked = any(self.is_obstacle_at(cx, y1 + i/10) for i in range(0, int(probe_dist*10)))
+            bottom_blocked = any(self.is_obstacle_at(cx, y0 - i/30) for i in range(0, int(probe_dist*30)))
+            top_blocked = any(self.is_obstacle_at(cx, y1 + i/30) for i in range(0, int(probe_dist*30)))
             if bottom_blocked and not top_blocked: base_yaw = -math.pi / 2.0
             elif not bottom_blocked and top_blocked: base_yaw = math.pi / 2.0
             else: base_yaw = math.pi / 2.0
@@ -264,7 +264,7 @@ class PlannerSkeleton:
 
     def hybrid_a_star(self, start, goal):
         import time
-        start_node = Node(0, 0, start[0], start[1], start[2], None, 1)
+        start_node = Node(0, 0, start[0], start[1], start[2], None, self.current_gear_state)
         goal_x, goal_y, goal_yaw = goal
 
         open_list = []
@@ -273,21 +273,19 @@ class PlannerSkeleton:
         visited = {}
         visited[self.get_grid_index(start_node.x, start_node.y, start_node.yaw)] = 0.0
 
-        step_size = 0.6
+        step_size = 0.8
         max_iter = 3000
         wheelbase = 2.5
         
-        # [핵심 수정 1] 계획기상의 조향각 제한을 실제보다 낮게 설정 (0.6 -> 0.55)
-        # 이렇게 하면 알고리즘이 "미리 덜 꺾이는 경로"를 계산하므로, 실제 주행 시 회전 반경 여유가 생김
-        simulated_max_steer = 0.55
-        steer_actions = [-simulated_max_steer, 0, simulated_max_steer]
+        simulated_max_steer = 0.6*1.1
+        steer_actions = [-simulated_max_steer, -simulated_max_steer*2/3, -simulated_max_steer/3, 0, simulated_max_steer/3, simulated_max_steer*2/3, simulated_max_steer]
         
         directions = [1, -1]
         iter_count = 0
         closest_node = start_node
         min_dist_to_goal = float('inf')
         start_time = time.time()
-        time_limit = 0.3 # 타임아웃 약간 여유있게
+        time_limit = 0.2 
 
         while open_list:
             if time.time() - start_time > time_limit:
@@ -304,8 +302,8 @@ class PlannerSkeleton:
                 min_dist_to_goal = dist
                 closest_node = current
 
-            # 종료 조건: 거리 0.5m, 각도 30도 이내
-            if dist < 0.5 and angle_diff < 0.5:
+            # 종료 조건: 거리 0.4m, 각도 ? 이내
+            if dist < 0.4 and angle_diff < 0.39:
                 closest_node = current
                 break
 
@@ -328,14 +326,14 @@ class PlannerSkeleton:
 
                     # 비용 함수
                     steer_cost = abs(steer) * 0.1
-                    switch_cost = 5.0 if current.direction != d else 0.0
+                    switch_cost = 100.0 if current.direction != d else 0.0
                     rev_cost = 0.1 if d == -1 else 0.0
                     new_g = current.g + step_size + steer_cost + switch_cost + rev_cost
                     
                     # 휴리스틱 강화 (목표 지향적)
                     h_dist = math.hypot(next_x - goal_x, next_y - goal_y)
                     h_angle = abs(self.normalize_angle(next_yaw - goal_yaw))
-                    h = (h_dist + h_angle * 2.2) # 각도 가중치 증가
+                    h = (h_dist + h_angle * 2) # 각도 가중치 증가
                     
                     idx = self.get_grid_index(next_x, next_y, next_yaw)
                     if idx not in visited or new_g < visited[idx]:
@@ -353,6 +351,7 @@ class PlannerSkeleton:
     def compute_path(self, obs: Dict[str, Any]) -> None:
         """
         상태(APPROACH / PARKING)에 따라 경로를 생성합니다.
+        + 주차 막바지(1.5m 이내)에는 알고리즘을 끄고 직선 진입을 강제합니다.
         """
         if not self.stationary_grid: return
         slot = obs.get("target_slot") or obs.get("target")
@@ -362,42 +361,57 @@ class PlannerSkeleton:
         state = obs.get("state", {})
         sx, sy, syaw = float(state.get("x")), float(state.get("y")), float(state.get("yaw"))
 
-        # [중요] 이미 주행 중인 경로가 충분히 남아있으면 재계산 금지 (연산 부하 방지)
-        # 단, compute_control에서 self.waypoints = []로 비웠다면 재계산 수행됨
+        # 이미 주행 중인 경로가 충분히 남아있으면 재계산 금지
         if self.waypoints and len(self.waypoints) > 2:
             return
 
         # 목표 위치(주차칸 중심) 계산
         fx, fy, fyaw = self.get_final_pose(self.cached_target)
+        
+        # 목표까지 남은 거리
+        dist_to_final = math.hypot(fx - sx, fy - sy)
 
-        # 1. 접근 모드 (멀리서 근처까지)
+        # 1. 접근 모드 (Grid A*)
         if self.planning_mode == "APPROACH":
             ex, ey = self.get_entry_pose(self.cached_target)
-            
-            # 시작점 -> 진입점 (Grid A*)
             print(f"[algo] Path Planning: APPROACH (Grid A*) -> Entry({ex:.1f}, {ey:.1f})")
             path = self.a_star_grid((sx, sy), (ex, ey))
             
             if path:
                 self.waypoints = path
             else:
-                # Grid A* 실패 시 비상 대책: 바로 PARKING 모드로 넘겨서 Hybrid 시도
                 print("[algo] Grid A* Failed! Forcing switch to PARKING mode.")
                 self.planning_mode = "PARKING" 
         
-        # 2. 주차 모드 (근처에서 주차칸으로)
+        # 2. 주차 모드 (Hybrid A*)
         if self.planning_mode == "PARKING":
-            print(f"[algo] Path Planning: PARKING (Hybrid A*) -> Slot({fx:.1f}, {fy:.1f})")
             
-            # 시작점 -> 주차칸 (Hybrid A*)
-            # Hybrid A*는 (x, y, yaw) 3차원 상태를 모두 고려
+            # [핵심 수정] 주차칸 내부 진입 시(1.5m 이내) 복잡한 계산 금지!
+            # Hybrid A*가 각도를 맞추려고 차를 밖으로 빼는 것을 방지함
+            if dist_to_final < 1.5:
+                print(f"[algo] Final Phase ({dist_to_final:.2f}m): Force Direct Interpolation.")
+                
+                # 알고리즘을 돌리지 않고, 현재 위치에서 목표 위치로 그냥 선을 그어버림
+                # (기어는 현재 기어 유지)
+                gear = self.current_gear_state
+                
+                # 목표점 하나만 딱 찍어줌 (P제어가 알아서 핸들 돌려서 감)
+                # 형식: (x, y, yaw, gear)
+                self.waypoints = [
+                    (sx, sy, syaw, gear), # 시작점(현재위치)
+                    (fx, fy, fyaw, gear)  # 끝점(주차칸중심)
+                ]
+                return
+
+            # 거리가 1.5m 이상일 때만 Hybrid A* 사용
+            print(f"[algo] Path Planning: PARKING (Hybrid A*) -> Slot({fx:.1f}, {fy:.1f})")
             path = self.hybrid_a_star((sx, sy, syaw), (fx, fy, fyaw))
             
             if path:
                 self.waypoints = path
             else:
                 print("[algo] Hybrid A* Failed! Retrying next step...")
-                self.waypoints = [(sx, sy, syaw), (fx, fy, fyaw)] # 실패 시 직선 경로 fallback
+                self.waypoints = [] 
 
     def compute_control(self, obs: Dict[str, Any]) -> Dict[str, float]:
         state = obs.get("state", {})
@@ -406,9 +420,11 @@ class PlannerSkeleton:
         v = float(state.get("v", 0.0))
 
         if not hasattr(self, 'planning_mode'): self.planning_mode = "APPROACH"
+        if not hasattr(self, 'current_gear_state'): self.current_gear_state = 1
+        
         cmd = {"steer": 0.0, "accel": 0.0, "brake": 0.0, "gear": "D"}
 
-        # 1. 도착 판정 (매우 엄격하게 15cm)
+        # 1. 도착 판정
         if self.cached_target:
             fx, fy, _ = self.get_final_pose(self.cached_target)
             dist_to_goal = math.hypot(fx - x, fy - y)
@@ -417,10 +433,10 @@ class PlannerSkeleton:
                 print(f"[algo] Switching to PARKING mode.")
                 self.planning_mode = "PARKING"
                 self.waypoints = [] 
-                cmd["brake"] = 1.0
+                cmd["brake"] = 0.9
                 return cmd
 
-            if self.planning_mode == "PARKING" and dist_to_goal < 0.15: # 15cm
+            if self.planning_mode == "PARKING" and dist_to_goal < 0.2:
                 print("[algo] Parking Perfect.")
                 self.waypoints = []
                 cmd["brake"] = 1.0
@@ -431,44 +447,91 @@ class PlannerSkeleton:
             cmd["brake"] = 1.0
             return cmd
 
-        # 2. 웨이포인트 정리
-        while self.waypoints:
-            wx, wy = self.waypoints[0][:2]
-            dx, dy = wx - x, wy - y
+        # ==================================================================
+        # [핵심 수정] 미래 점 검증을 통한 스마트 웨이포인트 삭제
+        # ==================================================================
+        while len(self.waypoints) > 1: # 마지막 1개는 남겨둠
+            current_wp = self.waypoints[0]
+            
+            # 1. 기어 방향이 다르면 삭제 금지 (변곡점 보호)
+            if current_wp[3] != self.current_gear_state:
+                break
+
+            # 2. 현재 점의 상태 (거리, 앞/뒤)
+            dx = current_wp[0] - x
+            dy = current_wp[1] - y
             dist = math.hypot(dx, dy)
-            local_x = dx * math.cos(yaw) + dy * math.sin(yaw)
+            
+            # Local X: 양수=앞, 음수=뒤
+            if self.current_gear_state == 1:
+                local_x = dx * math.cos(yaw) + dy * math.sin(yaw)
+            else:
+                local_x = -(dx * math.cos(yaw) + dy * math.sin(yaw))
 
             should_pop = False
-            if len(self.waypoints) == 1:
-                if dist < 0.1: should_pop = True
-            else:
-                # [수정] PARKING 모드에서는 점을 아주 촘촘하게(0.2m) 따라가며 늦은 턴 방지
-                pop_dist = 0.2 if self.planning_mode == "PARKING" else 0.8
-                if dist < pop_dist or local_x < -0.05: # 뒤로 조금이라도 넘어가면 삭제
-                    should_pop = True
+
+            # (A) 너무 가까우면 무조건 삭제 (0.3m)
+            if dist < 0.3:
+                should_pop = True
             
-            if should_pop: self.waypoints.pop(0)
-            else: break
+            # (B) 내 차 뒤로 넘어갔을 때 (-0.1m) -> 미래 점을 확인해서 삭제 결정
+            elif local_x < -0.1:
+                # 미래의 점(최대 3개 뒤)이 "내 앞"에 있는지 확인
+                is_future_in_front = False
+                check_limit = min(len(self.waypoints), 4) # 현재 포함 4개까지 확인
+                
+                for i in range(1, check_limit):
+                    next_wp = self.waypoints[i]
+                    
+                    # 미래 점이 기어 방향이 다르면 검사 중단 (거긴 다른 구간임)
+                    if next_wp[3] != self.current_gear_state:
+                        break
+                        
+                    ndx = next_wp[0] - x
+                    ndy = next_wp[1] - y
+                    
+                    if self.current_gear_state == 1:
+                        n_local_x = ndx * math.cos(yaw) + ndy * math.sin(yaw)
+                    else:
+                        n_local_x = -(ndx * math.cos(yaw) + ndy * math.sin(yaw))
+                    
+                    # 미래의 점이 확실히 내 앞(0.5m 이상)에 있다면?
+                    # -> "나는 현재 점을 지나쳐서 미래 점으로 가고 있다"는 증거
+                    if n_local_x > 0.2:
+                        is_future_in_front = True
+                        break
+                
+                # 미래 점이 앞에 있다는 게 확인된 경우에만 삭제
+                if is_future_in_front:
+                    should_pop = True
+
+            if should_pop:
+                self.waypoints.pop(0)
+            else:
+                break
         
         if not self.waypoints:
             cmd["brake"] = 1.0
             return cmd
 
-        # 3. Lookahead & Steer Gain (핵심)
+        # 3. 타겟 선정 (Lookahead)
         if self.planning_mode == "PARKING":
-            # 주차 시: 가까운 점을 보고 + 핸들을 과격하게 꺾음
-            lookahead = 0.6
-            steer_gain = 1.5  # [핵심 수정 2] Gain 1.0 -> 1.5 (부족 조향 보상)
+            lookahead = 2.0
+            steer_gain = 2.0 
         else:
             lookahead = 2.0 + 0.3 * abs(v)
             steer_gain = 1.0
 
         target_wp = self.waypoints[0]
         for wp in self.waypoints:
+            if wp[3] != self.current_gear_state: # 기어 다른 점은 타겟 불가
+                target_wp = wp
+                break
             if math.hypot(wp[0] - x, wp[1] - y) >= lookahead:
                 target_wp = wp
                 break
         
+        # 4. 기어 변경
         desired_dir = target_wp[3]
         if desired_dir != self.current_gear_state:
             if abs(v) > 0.05:
@@ -480,6 +543,7 @@ class PlannerSkeleton:
 
         cmd["gear"] = "D" if self.current_gear_state == 1 else "R"
 
+        # 5. 조향
         dx = target_wp[0] - x
         dy = target_wp[1] - y
         target_yaw = math.atan2(dy, dx)
@@ -490,18 +554,21 @@ class PlannerSkeleton:
             back_yaw = normalize_angle(yaw + math.pi)
             heading_error = normalize_angle(target_yaw - back_yaw)
 
-        # 조향 명령 생성
-        raw_steer = steer_gain * heading_error
-        
+        raw_steer = steer_gain * heading_error * self.current_gear_state
         limits = obs.get("limits", {})
         max_steer = float(limits.get("maxSteer", 0.6))
         cmd["steer"] = max(-max_steer, min(max_steer, raw_steer))
 
-        # 4. 속도 제어 (주차 시 아주 느리게)
+        # 6. 속도
         total_dist = math.hypot(self.waypoints[-1][0] - x, self.waypoints[-1][1] - y)
         if self.planning_mode == "PARKING":
-            target_speed = 0.5
-            if total_dist < 1.5: target_speed = 0.3 # 마지막엔 기어가기
+            target_speed = 0.7
+            if total_dist < 1.5:
+                target_speed = 0.3
+            if total_dist < 0.5:
+                target_speed = 0.15   
+        elif dist_to_goal > 12:
+            target_speed = 5.0
         else:
             target_speed = 2.0
 
@@ -511,6 +578,10 @@ class PlannerSkeleton:
             cmd["accel"] = 0.5 * (target_speed - abs(v))
         else:
             if abs(v) > target_speed + 0.2: cmd["brake"] = 0.3
+
+        # 경로 전송
+        path_to_send = [[wp[0], wp[1]] for wp in self.waypoints]
+        cmd["active_path"] = path_to_send
 
         return cmd
 
