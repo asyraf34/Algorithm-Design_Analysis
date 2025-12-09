@@ -9,6 +9,7 @@ import heapq
 import math
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+import time
 
 
 def pretty_print_map_summary(map_payload: Dict[str, Any]) -> None:
@@ -24,6 +25,19 @@ def pretty_print_map_summary(map_payload: Dict[str, Any]) -> None:
         cols = len(stationary[0]) if stationary else 0
         print("[algo] grid size  :", rows, "x", cols)
 
+class Node:
+    def __init__(self, f, g, x, y, yaw, parent=None, direction=1):
+        self.f = f
+        self.g = g
+        self.x = x
+        self.y = y
+        self.yaw = yaw
+        self.parent = parent
+        self.direction = direction
+
+    # 힙큐(PriorityQueue)에서 비용(f) 비교를 위해 필요
+    def __lt__(self, other):
+        return self.f < other.f
 
 @dataclass
 class PlannerSkeleton:
@@ -37,6 +51,10 @@ class PlannerSkeleton:
     cached_target: Optional[Tuple[float, float, float, float]] = None
     turn_in_point: Optional[Tuple[float, float]] = None
     turn_in_triggered: bool = False
+    previous_heading_error: Optional[float] = None
+
+    # [추가] 이전 조향각을 기억하기 위한 변수
+    prev_steer: float = 0.0 
 
     def __post_init__(self) -> None:
         if self.waypoints is None:
@@ -102,334 +120,355 @@ class PlannerSkeleton:
 
         # Inflate obstacles to give the ego vehicle clearance against borders/parked cars.
         # This helps avoid collisions caused by planning too close to obstacles.
-        self.inflate_obstacles()
+        self.inflate_obstacles(0.3)
+    
+    # 기존 PlannerSkeleton 내부의 메서드들을 이것들로 교체하세요
+
+    def normalize_angle(self, angle: float) -> float:
+        while angle > math.pi: angle -= 2.0 * math.pi
+        while angle < -math.pi: angle += 2.0 * math.pi
+        return angle
+
+    def get_grid_index(self, x: float, y: float, yaw: float) -> Tuple[int, int, int]:
+        # 1.0m 단위 그리드, 15도(0.26rad) 단위 각도 (속도를 위해 그리드를 키움)
+        return (int(round(x)), int(round(y)), int(round(yaw / 0.26)))
+
+    def is_collision(self, x: float, y: float) -> bool:
+        if not self.stationary_grid: return False
+        min_x, max_x, min_y, max_y = self.map_extent or (0, 0, 0, 0)
+        
+        # 맵 밖으로 나가면 충돌
+        if not (min_x <= x <= max_x and min_y <= y <= max_y): return True
+
+        # 그리드 인덱스 변환
+        gx = int((x - min_x) / self.cell_size)
+        gy = int((y - min_y) / self.cell_size)
+        
+        rows = len(self.stationary_grid)
+        cols = len(self.stationary_grid[0]) if rows > 0 else 0
+        
+        if 0 <= gx < cols and 0 <= gy < rows:
+            # 0.5 이상이면 장애물로 간주
+            return self.stationary_grid[gy][gx] > 0.5
+        return True
+
+    def hybrid_a_star(self, start, goal):
+        """
+        """
+        import time # 함수 내 import 혹은 파일 상단 이동
+        
+        if self.is_collision(start[0], start[1]):
+            print(f"[algo] FAIL: Start {start} is in OBSTACLE!")
+            return []
+        
+        # Node: (f, g, x, y, yaw, parent, direction)
+        start_node = Node(0, 0, start[0], start[1], start[2], None, 1)
+        goal_x, goal_y, goal_yaw = goal
+
+        open_list = []
+        heapq.heappush(open_list, start_node)
+        
+        visited = {}
+        visited[self.get_grid_index(start_node.x, start_node.y, start_node.yaw)] = 0.0
+
+        # 파라미터 설정
+        step_size = 1.0
+        max_iter = 5000
+        wheelbase = 2.5
+        max_steer = 0.6
+        steer_actions = [-max_steer, 0, max_steer]
+        directions = [1, -1] # 1: 전진, -1: 후진
+
+        iter_count = 0
+        
+        # 타임아웃 및 최적해 보존용
+        closest_node = start_node
+        min_dist_to_goal = float('inf')
+        start_time = time.time()
+        time_limit = 0.15 
+
+        while open_list:
+            if time.time() - start_time > time_limit:
+                print(f"[algo] Time Limit! ({time_limit}s) Using best partial path.")
+                break
+
+            if iter_count > max_iter:
+                print("[algo] Max iterations reached. Using best partial path.")
+                break
+            iter_count += 1
+
+            current = heapq.heappop(open_list)
+
+            dist = math.hypot(current.x - goal_x, current.y - goal_y)
+            angle_diff = abs(self.normalize_angle(current.yaw - goal_yaw))
+            
+            # 가장 가까운 노드 기록
+            if dist < min_dist_to_goal:
+                min_dist_to_goal = dist
+                closest_node = current
+
+            # 종료 조건 (거리 1.0m, 각도 35도 이내)
+            if dist < 1.0 and (angle_diff < 0.6 or abs(angle_diff - math.pi) < 0.6):
+                closest_node = current
+                break
+
+            for d in directions:
+                for steer in steer_actions:
+                    # 이동 모델
+                    if abs(steer) < 0.001:
+                        next_x = current.x + d * step_size * math.cos(current.yaw)
+                        next_y = current.y + d * step_size * math.sin(current.yaw)
+                        next_yaw = current.yaw
+                    else:
+                        turn_radius = wheelbase / math.tan(steer)
+                        beta = (d * step_size) / turn_radius
+                        cx = current.x - math.sin(current.yaw) * turn_radius
+                        cy = current.y + math.cos(current.yaw) * turn_radius
+                        next_x = cx + math.sin(current.yaw + beta) * turn_radius
+                        next_y = cy - math.cos(current.yaw + beta) * turn_radius
+                        next_yaw = self.normalize_angle(current.yaw + beta)
+
+                    if self.is_collision(next_x, next_y): continue
+
+                    # ---------------------------------------------------------
+                    # [핵심 수정] 비용 함수
+                    # ---------------------------------------------------------
+                    steer_cost = abs(steer) * 0.1
+                    
+                    # 기어 변경 비용 (매우 비싸게 -> 한 번 움직이면 쭉 가게 함)
+                    switch_cost = 30.0 if current.direction != d else 0.0
+                    
+                    # 후진 비용 (매우 싸게 -> 후진 두려워하지 않음)
+                    rev_cost = 0.1 if d == -1 else 0.0
+                    
+                    new_g = current.g + step_size + steer_cost + switch_cost + rev_cost
+                    
+                    # 휴리스틱 (가중치 1.5배)
+                    h_dist = math.hypot(next_x - goal_x, next_y - goal_y)
+                    h_angle = abs(self.normalize_angle(next_yaw - goal_yaw))
+                    h = (h_dist + h_angle * 2.0) * 1.5 
+                    
+                    idx = self.get_grid_index(next_x, next_y, next_yaw)
+                    
+                    if idx not in visited or new_g < visited[idx]:
+                        visited[idx] = new_g
+                        # 방향(d) 정보 저장
+                        new_node = Node(new_g + h, new_g, next_x, next_y, next_yaw, current, d)
+                        heapq.heappush(open_list, new_node)
+
+        # 경로 복원 (x, y, direction)
+        path = []
+        node = closest_node
+        while node:
+            path.append((node.x, node.y, node.direction))
+            node = node.parent
+        
+        # print(f"[algo] Iter: {iter_count}, Time: {time.time()-start_time:.3f}s")
+        return path[::-1]
 
     def compute_path(self, obs: Dict[str, Any]) -> None:
-        """관측과 맵을 이용해 경로(웨이포인트)를 준비합니다."""
-
-        if not self.map_extent or self.stationary_grid is None:
-            return
+        if not self.map_extent or self.stationary_grid is None: return
 
         slot = obs.get("target_slot") or obs.get("target")
-        if slot:
-            self.cached_target = tuple(slot)
-        elif not self.cached_target:
+        if slot: self.cached_target = tuple(slot)
+        if not self.cached_target: return
+
+        state = obs.get("state", {})
+        sx, sy, syaw = float(state.get("x", 0)), float(state.get("y", 0)), float(state.get("yaw", 0))
+        
+        goal_slot = self.cached_target
+        gx = (goal_slot[0] + goal_slot[1]) / 2.0
+        gy = (goal_slot[2] + goal_slot[3]) / 2.0
+
+        dist_to_goal = math.hypot(gx - sx, gy - sy)
+
+        # [수정된 Lock 로직]
+        # 3.0m 이내이고 "경로가 남아있을 때만" 재계산 금지.
+        # 즉, compute_control에서 경로를 날려버렸으면(len=0), 여기서 뚫고 지나가서 재계산합니다.
+        if dist_to_goal < 3.0 and self.waypoints and len(self.waypoints) > 0:
             return
 
-        # Reset the turn-in trigger for a new planning cycle.
-        self.turn_in_triggered = False
-
-        start = (float(obs.get("state", {}).get("x", 0.0)), float(obs.get("state", {}).get("y", 0.0)))
-        goal_slot = self.cached_target
-        goal = ((goal_slot[0] + goal_slot[1]) / 2.0, (goal_slot[2] + goal_slot[3]) / 2.0)
-
-        # Create an intermediate entry waypoint that sits just outside the parking
-        # slot along its longitudinal axis. This encourages the car to begin
-        # turning earlier so it approaches the target space with the correct
-        # alignment instead of diving in late.
-        span_x = abs(goal_slot[1] - goal_slot[0])
-        span_y = abs(goal_slot[3] - goal_slot[2])
-        axis = (1.0, 0.0) if span_x >= span_y else (0.0, 1.0)
-        half_len = max(span_x, span_y) / 2.0
-        start_to_goal = (start[0] - goal[0], start[1] - goal[1])
-        direction = 1.0 if start_to_goal[0] * axis[0] + start_to_goal[1] * axis[1] >= 0 else -1.0
-
-        # Encourage an earlier turn-in by defining a trigger point that lines up
-        # with the midpoint of the grid cell immediately before the slot
-        # entrance. Starting the steering arc just ahead of the slot opening
-        # helps the vehicle sweep into the space without clipping obstacles.
-
-        min_x, max_x, min_y, max_y = self.map_extent or (0.0, 0.0, 0.0, 0.0)
-        if span_x >= span_y:
-            dist_to_edge = min(abs(goal[0] - min_x), abs(max_x - goal[0]))
-        else:
-            dist_to_edge = min(abs(goal[1] - min_y), abs(max_y - goal[1]))
-
-        # Increase the entry offset for slots that sit along the outermost rows.
-        # When the target is tight against the top/bottom (or left/right) edge,
-        # the vehicle used to cut in too early and scrape nearby obstacles.
-        # Expanding the offset forces the car to drive deeper into the lane
-        # before turning toward the slot, mirroring the safer behaviour seen on
-        # middle rows.
-        approach_margin = max(self.cell_size * 2.0, 1.5)
-        edge_buffer = max(self.cell_size * 6.0, 3.0)
-        if dist_to_edge < edge_buffer:
-            approach_margin = max(approach_margin, edge_buffer)
-        entry_point = (
-            goal[0] + axis[0] * direction * (half_len + approach_margin),
-            goal[1] + axis[1] * direction * (half_len + approach_margin),
-        )
-        # Place the turn-in trigger further upstream of the entry point so the
-        # steering arc begins earlier. Keeping at least ~3 cells of clearance
-        # ahead of the slot mouth gives the vehicle enough room to swing into
-        # the target bay without overshooting.
-        turn_in_offset = max(
-            half_len + 0.5 * self.cell_size,
-            (half_len + approach_margin) - self.cell_size * 3.0,
-        )
-        turn_in_point = (
-            goal[0] + axis[0] * direction * turn_in_offset,
-            goal[1] + axis[1] * direction * turn_in_offset,
-        )
-
-        grid_rows = len(self.stationary_grid)
-        grid_cols = len(self.stationary_grid[0]) if grid_rows else 0
-
-        if grid_rows == 0 or grid_cols == 0:
-            print("[algo] stationary grid empty; falling back to direct goal")
-            self.waypoints = [goal]
+        if self.waypoints and len(self.waypoints) > 5:
             return
         
-        def world_to_grid(pt: Tuple[float, float]) -> Tuple[int, int]:
-            min_x, max_x, min_y, max_y = self.map_extent or (0, 0, 0, 0)
-            gx = int((pt[0] - min_x) / self.cell_size)
-            gy = int((pt[1] - min_y) / self.cell_size)
-            gx = max(0, min(grid_cols - 1, gx))
-            gy = max(0, min(grid_rows - 1, gy))
-            return gx, gy
+        span_x = abs(goal_slot[1] - goal_slot[0])
+        span_y = abs(goal_slot[3] - goal_slot[2])
+        gyaw = 0.0 if span_x > span_y else (math.pi / 2.0)
 
-        def grid_to_world(idx: Tuple[int, int]) -> Tuple[float, float]:
-            min_x, max_x, min_y, max_y = self.map_extent or (0, 0, 0, 0)
-            wx = min_x + (idx[0] + 0.5) * self.cell_size
-            wy = min_y + (idx[1] + 0.5) * self.cell_size
-            return wx, wy
+        print(f"[algo] Planning Start.. {sx:.1f},{sy:.1f} -> {gx:.1f},{gy:.1f}")
 
-        start_idx = world_to_grid(start)
-        goal_idx = world_to_grid(goal)
-        entry_idx = world_to_grid(entry_point)
-        turn_in_idx = world_to_grid(turn_in_point)
-
-        def nearest_free(idx: Tuple[int, int]) -> Optional[Tuple[int, int]]:
-            if not in_bounds(idx):
-                return None
-            if not is_blocked(idx):
-                return idx
-            # Small BFS search to find the closest free cell if the start/goal lies on an obstacle.
-            frontier = [idx]
-            visited = {idx}
-            while frontier:
-                nxt_frontier: List[Tuple[int, int]] = []
-                for cell in frontier:
-                    for nb in neighbors(cell):
-                        if nb in visited:
-                            continue
-                        if not in_bounds(nb):
-                            continue
-                        if not is_blocked(nb):
-                            return nb
-                        visited.add(nb)
-                        nxt_frontier.append(nb)
-                frontier = nxt_frontier
-            return None
-
-        def in_bounds(idx: Tuple[int, int]) -> bool:
-            x, y = idx
-            return 0 <= x < grid_cols and 0 <= y < grid_rows
-
-        def is_blocked(idx: Tuple[int, int]) -> bool:
-            x, y = idx
-            if not in_bounds(idx):
-                return True
-            return self.stationary_grid[y][x] > 0.5
-
-        def neighbors(idx: Tuple[int, int]) -> Iterable[Tuple[int, int]]:
-            x, y = idx
-            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-                nxt = (x + dx, y + dy)
-                if not is_blocked(nxt):
-                    yield nxt
-
-        def heuristic(a: Tuple[int, int], b: Tuple[int, int]) -> float:
-            return abs(a[0] - b[0]) + abs(a[1] - b[1])
-
-        def a_star(start_pt: Tuple[int, int], goal_pt: Tuple[int, int]) -> List[Tuple[int, int]]:
-            frontier: List[Tuple[float, Tuple[int, int]]] = []
-            heapq.heappush(frontier, (0.0, start_pt))
-            came_from: Dict[Tuple[int, int], Optional[Tuple[int, int]]] = {start_pt: None}
-            cost_so_far: Dict[Tuple[int, int], float] = {start_pt: 0.0}
-
-            while frontier:
-                _, current = heapq.heappop(frontier)
-                if current == goal_pt:
-                    break
-                for nxt in neighbors(current):
-                    new_cost = cost_so_far[current] + 1.0
-                    if nxt not in cost_so_far or new_cost < cost_so_far[nxt]:
-                        cost_so_far[nxt] = new_cost
-                        priority = new_cost + heuristic(nxt, goal_pt)
-                        heapq.heappush(frontier, (priority, nxt))
-                        came_from[nxt] = current
-
-            if goal_pt not in came_from:
-                return []
-
-            path: List[Tuple[int, int]] = []
-            cur = goal_pt
-            while cur is not None:
-                path.append(cur)
-                cur = came_from[cur]
-            path.reverse()
-            return path
-
-        start_free = nearest_free(start_idx)
-        entry_free = nearest_free(entry_idx)
-        goal_free = nearest_free(goal_idx)
-        turn_in_free = nearest_free(turn_in_idx)
-
-        # If the turn-in trigger snaps onto the same free cell as the entry
-        # point after inflation and snapping, back it up along the lane until we
-        # recover a distinct steering cue.
-        if (
-            turn_in_free is not None
-            and entry_free is not None
-            and turn_in_free == entry_free
-        ):
-            max_shift_cells = max(1, int(math.ceil(1.0 / self.cell_size)))
-            for step in range(1, max_shift_cells + 3):
-                candidate_point = (
-                    turn_in_point[0] - axis[0] * direction * self.cell_size * step,
-                    turn_in_point[1] - axis[1] * direction * self.cell_size * step,
-                )
-                candidate_free = nearest_free(world_to_grid(candidate_point))
-                if candidate_free is not None and candidate_free != entry_free:
-                    turn_in_free = candidate_free
-                    break
-
-        # Track the actual turn-in waypoint (post snapping) for debug logging
-        # inside the controller loop.
-        if turn_in_free is not None:
-            self.turn_in_point = grid_to_world(turn_in_free)
+        path = self.hybrid_a_star((sx, sy, syaw), (gx, gy, gyaw))
+        
+        if path:
+            self.waypoints = path
+            self.previous_heading_error = None
+            print(f"[algo] Path Found! Length: {len(path)}")
         else:
-            self.turn_in_point = turn_in_point
-
-        if start_free is None or goal_free is None:
-            print(
-                f"[algo] no free cell for start/goal (start={start_idx}, goal={goal_idx})"
-            )
-            self.waypoints = [goal]
-            return
-
-        # First try to navigate toward the turn-in trigger so steering can begin
-        # when the car nose aligns with the slot midpoint. Proceed from there to
-        # the entry point, then into the slot. If any intermediate waypoint is
-        # blocked, gracefully fall back to the remaining reachable targets.
-        path_idx: List[Tuple[int, int]] = []
-        current_start = start_free
-        if turn_in_free is not None:
-            path_to_turn_in = a_star(start_free, turn_in_free)
-            if path_to_turn_in:
-                path_idx.extend(path_to_turn_in)
-                current_start = turn_in_free
-
-        if entry_free is not None:
-            path_to_entry = a_star(current_start, entry_free)
-            if path_to_entry:
-                # Drop the first cell to avoid duplication where the two paths
-                # meet.
-                if path_idx and path_to_entry:
-                    path_idx.extend(path_to_entry[1:])
-                else:
-                    path_idx.extend(path_to_entry)
-                current_start = entry_free
-
-        if current_start is not None and goal_free is not None and current_start != goal_free:
-            path_from_entry = a_star(current_start, goal_free)
-            if path_from_entry:
-                path_idx.extend(path_from_entry[1:] if path_idx else path_from_entry)
-
-        if not path_idx:
-            path_idx = a_star(start_free, goal_free)
-        if not path_idx:
-            print(
-                f"[algo] A* failed to find path start={start_free} goal={goal_free}; using direct goal"
-            )
-            self.waypoints = [goal]
-        else:
-            self.waypoints = [grid_to_world(p) for p in path_idx]
-            print(
-                f"[algo] path len={len(path_idx)} start={start_free} goal={goal_free}"
-            )
+            print("[algo] A* Failed. Using fallback direct path.")
+            self.waypoints = [
+                (sx, sy, 1),      # 시작점 (현재 내 위치)
+                (gx, gy, 1)       # 목표점
+            ]
 
     def compute_control(self, obs: Dict[str, Any]) -> Dict[str, float]:
-        """경로를 따라가기 위한 조향/가감속 명령을 산출합니다."""
+        state = obs.get("state", {})
+        x, y = float(state.get("x")), float(state.get("y"))
+        yaw = self.normalize_angle(float(state.get("yaw")))
+        v = float(state.get("v", 0.0))
+
+        if not hasattr(self, 'current_gear_state'):
+            self.current_gear_state = 1 
+
+        # 0. 도착 판정 (최우선)
+        if self.cached_target:
+            goal_slot = self.cached_target
+            gx = (goal_slot[0] + goal_slot[1]) / 2.0
+            gy = (goal_slot[2] + goal_slot[3]) / 2.0
+            if math.hypot(gx - x, gy - y) < 0.5:
+                print("[algo] [Stop Reason] Goal Reached (Dist < 0.5m)")
+                self.waypoints = [] 
+                return {"steer": 0.0, "accel": 0.0, "brake": 1.0, "gear": "D"}
 
         self.compute_path(obs)
 
-        state = obs.get("state", {})
-        x = float(state.get("x", 0.0))
-        y = float(state.get("y", 0.0))
-        yaw = float(state.get("yaw", 0.0))
-        v = float(state.get("v", 0.0))
-
         limits = obs.get("limits", {})
         max_steer = float(limits.get("maxSteer", 0.6))
-        max_accel = float(limits.get("maxAccel", 2.0))
-        max_brake = float(limits.get("maxBrake", 5.0))
-
         cmd = {"steer": 0.0, "accel": 0.0, "brake": 0.0, "gear": "D"}
 
-        # Remove visited waypoints
-        waypoint_reached_threshold = max(self.cell_size * 0.8, 0.4)
-        if self.turn_in_point is not None and not self.turn_in_triggered:
-            distance_to_trigger = math.hypot(
-                self.turn_in_point[0] - x, self.turn_in_point[1] - y
-            )
-            trigger_radius = max(waypoint_reached_threshold * 1.2, self.cell_size)
-            if distance_to_trigger <= trigger_radius:
-                self.turn_in_triggered = True
-                print(
-                    (
-                        "[algo] turn-in trigger reached at "
-                        f"({self.turn_in_point[0]:.2f}, {self.turn_in_point[1]:.2f}) "
-                        f"t={obs.get('t', 0.0):.2f} remaining_wps={len(self.waypoints)}"
-                    )
-                )
-        while self.waypoints and math.hypot(self.waypoints[0][0] - x, self.waypoints[0][1] - y) < waypoint_reached_threshold:
-            self.waypoints.pop(0)
+        # ==================================================================
+        # [핵심 수정] 진행 방향 뒤쪽 웨이포인트 삭제 (Dot Product)
+        # ==================================================================
+        while self.waypoints:
+            wp_x, wp_y = self.waypoints[0][:2]
+            dx = wp_x - x
+            dy = wp_y - y
+            dist = math.hypot(dx, dy)
+
+            # 내적(Dot Product) 계산: 내 차의 앞뒤 방향 기준 위치 (local_x)
+            # 양수(+)면 내 차 앞, 음수(-)면 내 차 뒤
+            local_x = dx * math.cos(yaw) + dy * math.sin(yaw)
+
+            # 마지막 점은 함부로 지우지 않음 (0.5m까지 접근 허용)
+            is_last_point = (len(self.waypoints) == 1)
+            
+            should_pop = False
+
+            if is_last_point:
+                if dist < 0.5: should_pop = True
+            else:
+                # 1. 너무 가까우면 삭제 (기존 로직)
+                if dist < 1.0: 
+                    should_pop = True
+                
+                # 2. [추가된 로직] 진행 방향보다 뒤에 있으면 삭제
+                # 거리 2.5m 이내일 때만 적용 (너무 먼 점을 지우지 않도록)
+                elif dist < 2.5:
+                    if self.current_gear_state == 1: # [전진 중]
+                        # 점이 내 차 뒤(-0.1m)로 넘어갔다면 삭제
+                        if local_x < -0.1: should_pop = True
+                    else: # [후진 중]
+                        # 후진 중에는 내 차 '앞(양수)'에 있는 점이 실제로는 뒤로 지나친 점임
+                        if local_x > 0.1: should_pop = True
+
+            if should_pop:
+                self.waypoints.pop(0)
+            else:
+                break
+        # ==================================================================
 
         if not self.waypoints:
-            cmd["brake"] = 0.5
+            # 경로가 없으면 정지
+            cmd["brake"] = 1.0
             return cmd
 
-        # Use a simple lookahead to smooth steering. Selecting a waypoint that is a bit
-        # farther ahead helps the vehicle avoid scraping along borders when entering
-        # tight parking slots.
-        distance_to_goal = math.hypot(self.waypoints[-1][0] - x, self.waypoints[-1][1] - y)
-        lookahead_dist = max(self.cell_size * 1.5, min(self.cell_size * 3.0, distance_to_goal * 0.6))
+        # ... (이하 타겟 설정, 기어 변경, 주행 제어 등 기존 로직 유지) ...
+        # (아래 코드는 이전에 드린 코드와 동일합니다. 연결을 위해 생략하지 않고 적어드립니다)
+
+        # 2. 경로 이탈 감지 (완화됨)
+        if self.waypoints:
+            dists = [math.hypot(wp[0] - x, wp[1] - y) for wp in self.waypoints]
+            min_dist_to_path = min(dists)
+            if min_dist_to_path > 2.0 and abs(v) > 0.5:
+                print(f"[algo] [Stop Reason] Path Deviation ({min_dist_to_path:.2f}m). Coasting.")
+                self.waypoints = [] 
+                cmd["accel"] = 0.0
+                cmd["brake"] = 0.0 
+                return cmd
+
+        # 3. 타겟 웨이포인트 설정
         target_wp = self.waypoints[0]
+        lookahead_dist = 2.0
         for wp in self.waypoints:
             if math.hypot(wp[0] - x, wp[1] - y) >= lookahead_dist:
                 target_wp = wp
                 break
+        
+        # 4. 기어 변경 로직
+        desired_dir = target_wp[2] if len(target_wp) > 2 else 1
+        
+        if desired_dir != self.current_gear_state:
+            if abs(v) > 0.05:
+                cmd["gear"] = "D" if self.current_gear_state == 1 else "R"
+                cmd["accel"] = 0.0
+                cmd["brake"] = 1.0
+                return cmd 
+            else:
+                self.current_gear_state = desired_dir
+        
+        # 5. 주행 제어
+        min_accel = 0.4 if abs(v) < 0.3 else 0.0
 
-        dx = target_wp[0] - x
-        dy = target_wp[1] - y
-        heading_error = math.atan2(dy, dx) - yaw
-        while heading_error > math.pi:
-            heading_error -= 2 * math.pi
-        while heading_error < -math.pi:
-            heading_error += 2 * math.pi
+        if self.current_gear_state == 1: # [전진]
+            cmd["gear"] = "D"
+            dx = target_wp[0] - x
+            dy = target_wp[1] - y
+            target_yaw = math.atan2(dy, dx)
+            heading_error = self.normalize_angle(target_yaw - yaw)
+            
+            cmd["steer"] = 0.8 * heading_error
 
-        steer_gain = 1.2
-        cmd["steer"] = max(-max_steer, min(max_steer, steer_gain * heading_error))
+            target_speed = 1.5 if len(self.waypoints) > 2 else 0.5
+            if v < target_speed:
+                cmd["accel"] = max(min_accel, 0.5 * (target_speed - v))
+                cmd["brake"] = 0.0
+            else:
+                cmd["accel"] = 0.0
+                if v > target_speed + 0.3: cmd["brake"] = 0.3
 
-        target_speed = 1.5 if distance_to_goal > 3.0 else 0.5
+        else: # [후진]
+            cmd["gear"] = "R"
+            dx = target_wp[0] - x
+            dy = target_wp[1] - y
+            target_yaw = math.atan2(dy, dx)
+            
+            back_yaw = self.normalize_angle(yaw + math.pi)
+            heading_error = self.normalize_angle(target_yaw - back_yaw)
+            
+            cmd["steer"] = 0.6 * heading_error 
+            
+            target_speed_rev = 1.0
+            current_speed_abs = abs(v)
+            
+            if current_speed_abs < target_speed_rev:
+                calc_accel = 0.4 * (target_speed_rev - current_speed_abs)
+                cmd["accel"] = max(min_accel, calc_accel)
+                cmd["brake"] = 0.0
+            else:
+                cmd["accel"] = 0.0
+                if current_speed_abs > target_speed_rev + 0.3:
+                    cmd["brake"] = 0.3
 
-        if v < target_speed:
-            cmd["accel"] = min(max_accel, 0.8)
-            cmd["brake"] = 0.0
-        else:
-            cmd["accel"] = 0.0
-            cmd["brake"] = min(max_brake, 0.3)
-
-        if distance_to_goal < 0.7:
-            cmd["accel"] = 0.0
-            cmd["brake"] = min(max_brake, 0.8)
-
+        cmd["steer"] = max(-max_steer, min(max_steer, cmd["steer"]))
+        alpha = 0.2
+        if self.prev_steer is None: self.prev_steer = 0.0
+        smoothed_steer = alpha * self.prev_steer + (1 - alpha) * cmd["steer"]
+        cmd["steer"] = smoothed_steer
+        self.prev_steer = smoothed_steer
+        
         return cmd
 
     def inflate_obstacles(self, radius_m: float = 1.5) -> None:
-        """단순 팽창으로 차량 폭을 고려한 안전 여유를 확보합니다."""
+        """단순 팽창으로 차량 폭을 고려한 안전 여유를 확보합니다. (BFS 최적화 버전)"""
 
         if not self.stationary_grid:
             return
@@ -438,16 +477,34 @@ class PlannerSkeleton:
         grid_cols = len(self.stationary_grid[0]) if grid_rows else 0
         radius_cells = max(1, int(math.ceil(radius_m / self.cell_size)))
 
-        inflated = [[0.0 for _ in range(grid_cols)] for _ in range(grid_rows)]
-        for y in range(grid_rows):
-            for x in range(grid_cols):
-                if self.stationary_grid[y][x] <= 0.5:
-                    continue
-                for dy in range(-radius_cells, radius_cells + 1):
-                    for dx in range(-radius_cells, radius_cells + 1):
-                        nx, ny = x + dx, y + dy
-                        if 0 <= nx < grid_cols and 0 <= ny < grid_rows:
-                            inflated[ny][nx] = max(inflated[ny][nx], 1.0)
+        inflated = [row[:] for row in self.stationary_grid]  # 복사
+        
+        # 큐 초기화: 모든 장애물 셀을 (x, y, dist) 형태로 추가
+        queue = []
+        for r in range(grid_rows):
+            for c in range(grid_cols):
+                if inflated[r][c] > 0.5:
+                    queue.append((c, r, 0))
+
+        visited = set((q[0], q[1]) for q in queue)
+
+        head = 0
+        while head < len(queue):
+            x, y, dist = queue[head]
+            head += 1
+
+            if dist >= radius_cells:
+                continue
+
+            # 4방향 또는 8방향 이웃 탐색
+            for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)]:
+                nx, ny = x + dx, y + dy
+
+                if 0 <= nx < grid_cols and 0 <= ny < grid_rows:
+                    if (nx, ny) not in visited:
+                        inflated[ny][nx] = 1.0
+                        visited.add((nx, ny))
+                        queue.append((nx, ny, dist + 1))
 
         self.stationary_grid = inflated
         print(
