@@ -64,6 +64,7 @@ class PlannerSkeleton:
         occupied_idx = map_payload.get("occupied_idx") or []
         slots = map_payload.get("slots") or []
         self.cached_target = None
+        self.expected_orientation = map_payload.get("expected_orientation") or "front_in"
 
         def mark_rectangle(rect: Tuple[float, float, float, float]) -> None:
             if not self.stationary_grid: return
@@ -195,8 +196,8 @@ class PlannerSkeleton:
             else: base_yaw = -math.pi / 2.0
 
         final_yaw = base_yaw
-        if hasattr(self, 'expected_orientation') and self.expected_orientation == 'rear_in':
-            final_yaw = base_yaw + math.pi
+        # if hasattr(self, 'expected_orientation') and self.expected_orientation == 'rear_in':
+        #     final_yaw = base_yaw + math.pi
         
         final_yaw = normalize_angle(final_yaw)
         return cx, cy, final_yaw
@@ -205,12 +206,12 @@ class PlannerSkeleton:
         fx, fy, fyaw = self.get_final_pose(slot_coords)
         target_orientation = getattr(self, 'expected_orientation', 'front_in')
         
-        if target_orientation == 'rear_in':
-            ex = fx + offset_dist * math.cos(fyaw)
-            ey = fy + offset_dist * math.sin(fyaw)
-        else:
-            ex = fx - offset_dist * math.cos(fyaw)
-            ey = fy - offset_dist * math.sin(fyaw)
+        ex = fx - offset_dist * math.cos(fyaw)
+        ey = fy - offset_dist * math.sin(fyaw)
+        # if target_orientation == 'rear_in':
+        #     ex = fx + offset_dist * math.cos(fyaw)
+        #     ey = fy + offset_dist * math.sin(fyaw)
+        
         return ex, ey
 
     def a_star_grid(self, start, goal):
@@ -277,7 +278,7 @@ class PlannerSkeleton:
         max_iter = 2000
         wheelbase = 2.5
         
-        simulated_max_steer = 0.6*1.1
+        simulated_max_steer = 0.6*0.98
         steer_actions = [-simulated_max_steer, -simulated_max_steer*2/3, -simulated_max_steer/3, 0, simulated_max_steer/3, simulated_max_steer*2/3, simulated_max_steer]
         
         directions = [1, -1]
@@ -323,10 +324,12 @@ class PlannerSkeleton:
                         next_yaw = self.normalize_angle(current.yaw + beta)
 
                     if self.is_collision(next_x, next_y): continue
+                    dst_nxt_goal = math.hypot(next_x - goal_x, next_y - goal_y)
+                    if dst_nxt_goal > 9.2: continue
 
                     # 비용 함수
-                    steer_cost = abs(steer) * 0.9999
-                    switch_cost = 100.0 if current.direction != d else 0.0
+                    steer_cost = abs(steer) * 0.2
+                    switch_cost = 2.0 if current.direction != d else 0.0
                     rev_cost = 0.11 if d == -1 else 0.0
                     new_g = current.g + step_size + steer_cost + switch_cost + rev_cost
                     
@@ -343,6 +346,7 @@ class PlannerSkeleton:
 
         path = []
         node = closest_node
+        if node == closest_node: node = Node(0, 0, goal_x, goal_y, goal_yaw, node, 1)
         while node:
             path.append((node.x, node.y, node.yaw, node.direction))
             node = node.parent
@@ -448,25 +452,29 @@ class PlannerSkeleton:
             return cmd
 
         # ==================================================================
-        # [핵심 수정] 미래 점 검증을 통한 스마트 웨이포인트 삭제
+        # [핵심 수정] 각도 차이 기반 웨이포인트 삭제
         # ==================================================================
-        while len(self.waypoints) > 1: # 마지막 1개는 남겨둠
-            current_wp = self.waypoints[0]
+        while len(self.waypoints) > 1:
+            wx, wy, _, w_dir = self.waypoints[0]
             
-            # 1. 기어 방향이 다르면 삭제 금지 (변곡점 보호)
-            if current_wp[3] != self.current_gear_state:
+            # 1. 기어 방향 검증 (필수)
+            if w_dir != self.current_gear_state:
                 break
 
-            # 2. 현재 점의 상태 (거리, 앞/뒤)
-            dx = current_wp[0] - x
-            dy = current_wp[1] - y
+            dx = wx - x
+            dy = wy - y
             dist = math.hypot(dx, dy)
+
+            # 2. 내 차의 진행 방향 기준 각도 차이 계산
+            wp_angle = math.atan2(dy, dx)
             
-            # Local X: 양수=앞, 음수=뒤
-            if self.current_gear_state == 1:
-                local_x = dx * math.cos(yaw) + dy * math.sin(yaw)
-            else:
-                local_x = -(dx * math.cos(yaw) + dy * math.sin(yaw))
+            current_yaw = yaw
+            # 후진 중이면 차의 '뒤쪽'이 정면이므로 180도 돌려서 생각
+            if self.current_gear_state == -1:
+                current_yaw = normalize_angle(yaw + math.pi)
+                
+            angle_diff = abs(normalize_angle(wp_angle - current_yaw))
+            angle_deg = math.degrees(angle_diff)
 
             should_pop = False
 
@@ -474,37 +482,12 @@ class PlannerSkeleton:
             if dist < 0.3:
                 should_pop = True
             
-            # (B) 내 차 뒤로 넘어갔을 때 (-0.1m) -> 미래 점을 확인해서 삭제 결정
-            elif local_x < -0.1:
-                # 미래의 점(최대 3개 뒤)이 "내 앞"에 있는지 확인
-                is_future_in_front = False
-                check_limit = min(len(self.waypoints), 4) # 현재 포함 4개까지 확인
+            # (B) 각도가 너무 많이 벌어졌으면(지나쳤으면) 삭제
+            # 보통 90도(내적<0)가 기준이지만, 주차 시 코너링을 고려해 
+            # 조금 더 너그럽게 100~110도로 설정하면 '조기 삭제'로 인한 코너 컷팅을 방지함
+            elif angle_deg > 100.0:
+                should_pop = True
                 
-                for i in range(1, check_limit):
-                    next_wp = self.waypoints[i]
-                    
-                    # 미래 점이 기어 방향이 다르면 검사 중단 (거긴 다른 구간임)
-                    if next_wp[3] != self.current_gear_state:
-                        break
-                        
-                    ndx = next_wp[0] - x
-                    ndy = next_wp[1] - y
-                    
-                    if self.current_gear_state == 1:
-                        n_local_x = ndx * math.cos(yaw) + ndy * math.sin(yaw)
-                    else:
-                        n_local_x = -(ndx * math.cos(yaw) + ndy * math.sin(yaw))
-                    
-                    # 미래의 점이 확실히 내 앞(0.5m 이상)에 있다면?
-                    # -> "나는 현재 점을 지나쳐서 미래 점으로 가고 있다"는 증거
-                    if n_local_x > 0.2:
-                        is_future_in_front = True
-                        break
-                
-                # 미래 점이 앞에 있다는 게 확인된 경우에만 삭제
-                if is_future_in_front:
-                    should_pop = True
-
             if should_pop:
                 self.waypoints.pop(0)
             else:
@@ -517,7 +500,7 @@ class PlannerSkeleton:
         # 3. 타겟 선정 (Lookahead)
         if self.planning_mode == "PARKING":
             lookahead = 2.0
-            steer_gain = 2.0 
+            steer_gain = 2.0
         else:
             lookahead = 2.0 + 0.3 * abs(v)
             steer_gain = 1.0
@@ -534,14 +517,17 @@ class PlannerSkeleton:
         # 4. 기어 변경
         desired_dir = target_wp[3]
         if desired_dir != self.current_gear_state:
-            if abs(v) > 0.05:
-                cmd["brake"] = 1.0
-                return cmd
+            print(desired_dir)
+            # if abs(v) > 0.05:
+            #     cmd["brake"] = 0.3
+            #     return cmd
+            # print("[algo] try to change gear")
             self.current_gear_state = desired_dir
-            cmd["brake"] = 1.0
+            cmd["brake"] = 0.3
             return cmd
 
         cmd["gear"] = "D" if self.current_gear_state == 1 else "R"
+        if cmd["gear"] == "R": print("[algo] R")
 
         # 5. 조향
         dx = target_wp[0] - x
@@ -562,15 +548,15 @@ class PlannerSkeleton:
         # 6. 속도
         total_dist = math.hypot(self.waypoints[-1][0] - x, self.waypoints[-1][1] - y)
         if self.planning_mode == "PARKING":
-            target_speed = 0.7
+            target_speed = 1.5
             if total_dist < 1.5:
-                target_speed = 0.3
+                target_speed = 0.4
             if total_dist < 0.5:
                 target_speed = 0.15   
         elif dist_to_goal > 14:
             target_speed = 5.0
         else:
-            target_speed = 2.0
+            target_speed = 3.5
 
         if self.current_gear_state == -1: target_speed *= 0.7
 
