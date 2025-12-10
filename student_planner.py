@@ -282,6 +282,7 @@ class PlannerSkeleton:
         steer_actions = [-simulated_max_steer, -simulated_max_steer*2/3, -simulated_max_steer/3, 0, simulated_max_steer/3, simulated_max_steer*2/3, simulated_max_steer]
         
         directions = [1, -1]
+        # directions = [1]
         iter_count = 0
         closest_node = start_node
         min_dist_to_goal = float('inf')
@@ -433,7 +434,7 @@ class PlannerSkeleton:
             fx, fy, _ = self.get_final_pose(self.cached_target)
             dist_to_goal = math.hypot(fx - x, fy - y)
 
-            if self.planning_mode == "APPROACH" and dist_to_goal < 9.0:
+            if self.planning_mode == "APPROACH" and dist_to_goal < 8.5:
                 print(f"[algo] Switching to PARKING mode.")
                 self.planning_mode = "PARKING"
                 self.waypoints = [] 
@@ -551,9 +552,9 @@ class PlannerSkeleton:
             target_speed = 1.5
             if total_dist < 1.5:
                 target_speed = 0.4
-            if total_dist < 0.5:
-                target_speed = 0.15   
-        elif dist_to_goal > 14:
+            if total_dist < 0.57:
+                target_speed = 0.2  
+        elif dist_to_goal > 11:
             target_speed = 5.0
         else:
             target_speed = 3.5
