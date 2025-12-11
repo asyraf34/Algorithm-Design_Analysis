@@ -48,6 +48,7 @@ class PlannerSkeleton:
     prev_steer: float = 0.0 
     current_gear_state: int = 1   # 1: Drive, -1: Reverse
     planning_mode: str = "APPROACH" # "APPROACH": Grid A*, "PARKING": Hybrid A*
+    last_gear_change_time: float = 0.0 
 
     def __post_init__(self) -> None:
         if self.waypoints is None:
@@ -108,7 +109,7 @@ class PlannerSkeleton:
         return angle
 
     def get_grid_index(self, x: float, y: float, yaw: float) -> Tuple[int, int, int]:
-        return (int(round(x)), int(round(y)), int(round(yaw / 0.07)))
+        return (int(round(x)), int(round(y)), int(round(yaw / 0.08)))
 
     def is_collision(self, x: float, y: float) -> bool:
         if not self.stationary_grid: return False
@@ -278,7 +279,7 @@ class PlannerSkeleton:
         max_iter = 2000
         wheelbase = 2.5
         
-        simulated_max_steer = 0.6*0.98
+        simulated_max_steer = 0.6*0.92
         steer_actions = [-simulated_max_steer, -simulated_max_steer*2/3, -simulated_max_steer/3, 0, simulated_max_steer/3, simulated_max_steer*2/3, simulated_max_steer]
         
         directions = [1, -1]
@@ -316,6 +317,7 @@ class PlannerSkeleton:
                         next_y = current.y + d * step_size * math.sin(current.yaw)
                         next_yaw = current.yaw
                     else:
+                        if d == -1: continue # 후진과 동시에 턴하는 것이 잘 안 되는 모양
                         turn_radius = wheelbase / math.tan(steer)
                         beta = (d * step_size) / turn_radius
                         cx = current.x - math.sin(current.yaw) * turn_radius
@@ -330,8 +332,8 @@ class PlannerSkeleton:
 
                     # 비용 함수
                     steer_cost = abs(steer) * 0.2
-                    switch_cost = 2.0 if current.direction != d else 0.0
-                    rev_cost = 0.11 if d == -1 else 0.0
+                    switch_cost = 0.1 if current.direction != d else 0.0
+                    rev_cost = 0.1 if d == -1 else 0.0
                     new_g = current.g + step_size + steer_cost + switch_cost + rev_cost
                     
                     # 휴리스틱 강화 (목표 지향적)
@@ -347,7 +349,7 @@ class PlannerSkeleton:
 
         path = []
         node = closest_node
-        if node == closest_node: node = Node(0, 0, goal_x, goal_y, goal_yaw, node, 1)
+        # if node == closest_node: node = Node(0, 0, goal_x, goal_y, goal_yaw, node, 1)
         while node:
             path.append((node.x, node.y, node.yaw, node.direction))
             node = node.parent
@@ -360,14 +362,20 @@ class PlannerSkeleton:
         """
         if not self.stationary_grid: return
         slot = obs.get("target_slot") or obs.get("target")
-        if slot: self.cached_target = tuple(slot)
+         # [수정] 타겟이 새로 들어오거나 바뀌었으면 그리드 재구축
+        if slot:
+            new_target = tuple(slot)
+            if self.cached_target != new_target:
+                self.cached_target = new_target
+                self._update_grid_for_target(self.cached_target) # 여기서 벽을 세움
+                self.waypoints = [] # 맵이 바뀌었으니 경로 초기화
         if not self.cached_target: return
         
         state = obs.get("state", {})
         sx, sy, syaw = float(state.get("x")), float(state.get("y")), float(state.get("yaw"))
 
         # 이미 주행 중인 경로가 충분히 남아있으면 재계산 금지
-        if self.waypoints and len(self.waypoints) > 2:
+        if self.waypoints and len(self.waypoints) > 0:
             return
 
         # 목표 위치(주차칸 중심) 계산
@@ -429,66 +437,54 @@ class PlannerSkeleton:
         
         cmd = {"steer": 0.0, "accel": 0.0, "brake": 0.0, "gear": "D"}
 
-        # 1. 도착 판정
+        # 1. 도착 및 모드 전환
         if self.cached_target:
             fx, fy, _ = self.get_final_pose(self.cached_target)
+            ex, ey = self.get_entry_pose(self.cached_target)
             dist_to_goal = math.hypot(fx - x, fy - y)
+            dist_to_entry = math.hypot(ex - x, ey - y)
 
-            if self.planning_mode == "APPROACH" and dist_to_goal < 8.5:
-                print(f"[algo] Switching to PARKING mode.")
+            if self.planning_mode == "APPROACH" and dist_to_goal < 8.5 and dist_to_entry < 5.0:
+                print(f"[algo] Switch to PARKING mode.")
                 self.planning_mode = "PARKING"
                 self.waypoints = [] 
                 cmd["brake"] = 0.9
+                cmd["active_path"] = []
                 return cmd
 
             if self.planning_mode == "PARKING" and dist_to_goal < 0.2:
-                print("[algo] Parking Perfect.")
+                print("[algo] Parking Completed.")
                 self.waypoints = []
                 cmd["brake"] = 1.0
+                cmd["active_path"] = []
                 return cmd
 
-        self.compute_path(obs)
+        if not self.waypoints:
+            self.compute_path(obs)
         if not self.waypoints:
             cmd["brake"] = 1.0
+            cmd["active_path"] = []
             return cmd
 
-        # ==================================================================
-        # [핵심 수정] 각도 차이 기반 웨이포인트 삭제
-        # ==================================================================
+        # 2. 웨이포인트 정리 (일반 주행 중일 때만 삭제)
         while len(self.waypoints) > 1:
             wx, wy, _, w_dir = self.waypoints[0]
             
-            # 1. 기어 방향 검증 (필수)
+            # [중요] 다음 점의 기어 방향이 다르면(변곡점), 절대 삭제 금지!
             if w_dir != self.current_gear_state:
                 break
 
             dx = wx - x
             dy = wy - y
             dist = math.hypot(dx, dy)
+            local_x = dx * math.cos(yaw) + dy * math.sin(yaw)
+            if self.current_gear_state == -1: local_x *= -1 
 
-            # 2. 내 차의 진행 방향 기준 각도 차이 계산
-            wp_angle = math.atan2(dy, dx)
-            
-            current_yaw = yaw
-            # 후진 중이면 차의 '뒤쪽'이 정면이므로 180도 돌려서 생각
-            if self.current_gear_state == -1:
-                current_yaw = normalize_angle(yaw + math.pi)
-                
-            angle_diff = abs(normalize_angle(wp_angle - current_yaw))
-            angle_deg = math.degrees(angle_diff)
-
+            # 일반 주행 중 삭제 로직
             should_pop = False
-
-            # (A) 너무 가까우면 무조건 삭제 (0.3m)
-            if dist < 0.3:
-                should_pop = True
+            if dist < 0.5: should_pop = True
+            elif local_x < -0.1: should_pop = True
             
-            # (B) 각도가 너무 많이 벌어졌으면(지나쳤으면) 삭제
-            # 보통 90도(내적<0)가 기준이지만, 주차 시 코너링을 고려해 
-            # 조금 더 너그럽게 100~110도로 설정하면 '조기 삭제'로 인한 코너 컷팅을 방지함
-            elif angle_deg > 100.0:
-                should_pop = True
-                
             if should_pop:
                 self.waypoints.pop(0)
             else:
@@ -496,9 +492,12 @@ class PlannerSkeleton:
         
         if not self.waypoints:
             cmd["brake"] = 1.0
+            cmd["active_path"] = []
             return cmd
 
-        # 3. 타겟 선정 (Lookahead)
+        # ---------------------------------------------------------
+        # 3. 타겟 선정 (변곡점 탐색 로직 수정됨)
+        # ---------------------------------------------------------
         if self.planning_mode == "PARKING":
             lookahead = 2.0
             steer_gain = 2.0
@@ -506,29 +505,117 @@ class PlannerSkeleton:
             lookahead = 2.0 + 0.3 * abs(v)
             steer_gain = 1.0
 
-        target_wp = self.waypoints[0]
-        for wp in self.waypoints:
-            if wp[3] != self.current_gear_state: # 기어 다른 점은 타겟 불가
-                target_wp = wp
-                break
-            if math.hypot(wp[0] - x, wp[1] - y) >= lookahead:
-                target_wp = wp
+        # [핵심 수정] 리스트를 훑어서 "기어가 바뀌는 첫 번째 지점"을 찾음
+        next_gear_index = -1
+        for i, wp in enumerate(self.waypoints):
+            if wp[3] != self.current_gear_state:
+                next_gear_index = i
                 break
         
-        # 4. 기어 변경
-        desired_dir = target_wp[3]
-        if desired_dir != self.current_gear_state:
-            print(desired_dir)
-            # if abs(v) > 0.05:
-            #     cmd["brake"] = 0.3
-            #     return cmd
-            # print("[algo] try to change gear")
-            self.current_gear_state = desired_dir
-            cmd["brake"] = 0.3
-            return cmd
+        target_wp = None
+        dist_to_cusp = float('inf')
+        cusp_stop_mode = False
+
+        # 기어 바뀌는 점이 발견되면? -> 그 "직전 점"이 바로 변곡점(Cusp)이다!
+        if next_gear_index > 0:
+            cusp_index = next_gear_index - 1 # 여기가 멈춰야 할 점
+            cusp_wp = self.waypoints[cusp_index]
+            dist_to_cusp = math.hypot(cusp_wp[0]-x, cusp_wp[1]-y)
+            
+            # 변곡점이 시야(5m) 내에 들어오면 -> 변곡점 타겟 락킹
+            if dist_to_cusp < 5.0:
+                target_wp = cusp_wp
+                cusp_stop_mode = True # 정밀 정차 모드 발동
+            else:
+                # 아직 멀면 그냥 가던 대로 감
+                for wp in self.waypoints:
+                    if wp[3] != self.current_gear_state: break
+                    if math.hypot(wp[0]-x, wp[1]-y) >= lookahead:
+                        target_wp = wp
+                        break
+        
+        # 기어 바뀌는 점이 맨 처음(0번)이라면? -> 이미 변곡점을 지났거나 바로 앞임
+        elif next_gear_index == 0:
+             # 바로 기어 변경 로직으로 넘어가야 함
+             cusp_stop_mode = True
+             dist_to_cusp = 0.0 # 이미 도달했다고 가정
+             target_wp = self.waypoints[0] # 임시
+             
+        else:
+            # 변곡점 없음 (쭉 같은 기어)
+            target_wp = self.waypoints[0]
+            for wp in self.waypoints:
+                if math.hypot(wp[0]-x, wp[1]-y) >= lookahead:
+                    target_wp = wp
+                    break
+        
+        if target_wp is None: target_wp = self.waypoints[-1]
+
+        # ---------------------------------------------------------
+        # 4. 기어 변경 및 정밀 도달 제어
+        # ---------------------------------------------------------
+        
+        # [핵심 수정] 변곡점 정차 모드일 때
+        if cusp_stop_mode:
+            # 아직 5cm 이내로 도달 못했으면? -> 계속 밀고 들어가!
+            if dist_to_cusp > 0.05:
+                # 기어 변경 금지, 현재 기어로 계속 전진
+                desired_dir = self.current_gear_state 
+                
+                # 초근접 시(1m) 기어가듯 천천히
+                if dist_to_cusp < 1.0:
+                    cmd["accel"] = 0.2 if abs(v) < 0.2 else 0.0 
+                    cmd["brake"] = 0.0
+                    if abs(v) > 0.3: cmd["brake"] = 0.5 
+                    
+                    # 조향 계산 후 리턴 (속도 덮어쓰기 방지)
+                    dx = target_wp[0] - x
+                    dy = target_wp[1] - y
+                    target_yaw = math.atan2(dy, dx)
+                    
+                    # 조향 로직 (기존과 동일)
+                    if self.current_gear_state == 1:
+                        heading_error = normalize_angle(target_yaw - yaw)
+                    else:
+                        back_yaw = normalize_angle(yaw + math.pi)
+                        heading_error = normalize_angle(target_yaw - back_yaw)
+                    
+                    raw_steer = steer_gain * heading_error * self.current_gear_state
+                    limits = obs.get("limits", {})
+                    max_steer = float(limits.get("maxSteer", 0.6))
+                    cmd["steer"] = max(-max_steer, min(max_steer, raw_steer))
+                    cmd["gear"] = "D" if self.current_gear_state == 1 else "R"
+                    cmd["active_path"] = [[wp[0], wp[1], wp[3]] for wp in self.waypoints]
+                    return cmd
+            
+            else:
+                # 5cm 이내 도달! (이제 멈추고 기어 바꿀 차례)
+                if abs(v) > 0.1: 
+                    cmd["brake"] = 1.0
+                    cmd["accel"] = 0.0
+                    cmd["active_path"] = [[wp[0], wp[1], wp[3]] for wp in self.waypoints]
+                    return cmd
+                
+                # 다음 경로의 기어 방향 가져오기
+                next_gear = self.waypoints[next_gear_index][3] if next_gear_index < len(self.waypoints) else self.current_gear_state
+                
+                print(f"[algo] Cusp Reached! Switch {self.current_gear_state} -> {next_gear}")
+                self.current_gear_state = next_gear
+                self.last_gear_change_time = time.time()
+                
+                # [중요] 변곡점(현재 위치)까지 싹 지워버림 -> 남은 건 다음 기어 경로뿐
+                if next_gear_index != -1:
+                    self.waypoints = self.waypoints[next_gear_index:]
+                
+                cmd["brake"] = 1.0
+                cmd["active_path"] = [[wp[0], wp[1], wp[3]] for wp in self.waypoints]
+                return cmd
+
+        # 쿨타임 체크
+        if time.time() - self.last_gear_change_time < 1.0:
+            pass # 원하는 방향 유지
 
         cmd["gear"] = "D" if self.current_gear_state == 1 else "R"
-        if cmd["gear"] == "R": print("[algo] R")
 
         # 5. 조향
         dx = target_wp[0] - x
@@ -546,30 +633,28 @@ class PlannerSkeleton:
         max_steer = float(limits.get("maxSteer", 0.6))
         cmd["steer"] = max(-max_steer, min(max_steer, raw_steer))
 
-        # 6. 속도
-        total_dist = math.hypot(self.waypoints[-1][0] - x, self.waypoints[-1][1] - y)
+        # 6. 속도 제어
+        target_speed = 1.5
+        
+        # 주차 모드 정밀 감속
         if self.planning_mode == "PARKING":
-            target_speed = 1.5
-            if total_dist < 1.5:
-                target_speed = 0.4
-            if total_dist < 0.57:
-                target_speed = 0.2  
+            total_dist = math.hypot(self.waypoints[-1][0]-x, self.waypoints[-1][1]-y)
+            if total_dist < 1.5: target_speed = min(target_speed, 0.4)
+            if total_dist < 0.5: target_speed = 0.2 # 마지막 진입 시 아주 천천히
+            
         elif dist_to_goal > 11:
             target_speed = 5.0
         else:
             target_speed = 3.5
 
-        if self.current_gear_state == -1: target_speed *= 0.7
+        if self.current_gear_state == -1: target_speed = min(target_speed, 1.0)
 
         if abs(v) < target_speed:
             cmd["accel"] = 0.5 * (target_speed - abs(v))
         else:
             if abs(v) > target_speed + 0.2: cmd["brake"] = 0.3
 
-        # 경로 전송
-        path_to_send = [[wp[0], wp[1]] for wp in self.waypoints]
-        cmd["active_path"] = path_to_send
-
+        cmd["active_path"] = [[wp[0], wp[1], wp[3]] for wp in self.waypoints]
         return cmd
 
 planner = PlannerSkeleton()

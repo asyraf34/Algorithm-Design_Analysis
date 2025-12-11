@@ -2847,19 +2847,25 @@ def main():
                     pts = [world_to_screen(x, y, world, sw, sh) for (x, y) in traj]
                     pygame.draw.lines(screen, (50, 50, 200), False, pts, 2)
                 
+                draw_car(screen, state, delta, P, world, sw, sh)
                 # [추가] 계획된 경로(U.active_path) 그리기 (빨간색)
                 if active_path and len(active_path) > 1:
                     # (x, y) 좌표만 추출하여 화면 좌표로 변환
                     path_pts = []
+                    green = []
                     for wp in active_path:
                         # waypoints가 (x,y,yaw,dir) 형태일 수 있으므로 앞의 2개만 취함
                         px, py = wp[0], wp[1] 
-                        path_pts.append(world_to_screen(px, py, world, sw, sh))
+                        if len(wp)>2 and wp[2] == -1:
+                            green.append(world_to_screen(px, py, world, sw, sh))
+                            path_pts.append(world_to_screen(px, py, world, sw, sh))
+                        else:
+                            path_pts.append(world_to_screen(px, py, world, sw, sh))
                     
                     # 빨간색(255, 0, 0), 두께 2로 그리기
                     pygame.draw.lines(screen, (255, 50, 50), False, path_pts, 3)
+                    if green and len(green)>1: pygame.draw.lines(screen, (50, 255, 50), False, green, 3)
 
-                draw_car(screen, state, delta, P, world, sw, sh)
                 if collision_markers:
                     draw_collision_markers(screen, collision_markers, world, sw, sh)
 
