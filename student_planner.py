@@ -178,7 +178,7 @@ class PlannerSkeleton:
         cy = (y0 + y1) / 2.0
         width = abs(x1 - x0)
         height = abs(y1 - y0)
-        probe_dist = 1.5 
+        probe_dist = 2.0 
         base_yaw = 0.0
         
         if width > height:
@@ -195,7 +195,8 @@ class PlannerSkeleton:
             else: base_yaw = math.pi / 2.0
 
         final_yaw = base_yaw
-        if hasattr(self, 'expected_orientation') and self.expected_orientation == 'rear_in':
+        if getattr(self, "expected_orientation", "front_in") == "rear_in":
+            # Rear-in parking faces the car outward from the slot.
             final_yaw = base_yaw + math.pi
         
         final_yaw = normalize_angle(final_yaw)
@@ -205,12 +206,14 @@ class PlannerSkeleton:
         fx, fy, fyaw = self.get_final_pose(slot_coords)
         target_orientation = getattr(self, 'expected_orientation', 'front_in')
         
+        ex = fx - offset_dist * math.cos(fyaw)
+        ey = fy - offset_dist * math.sin(fyaw)
+
         if target_orientation == 'rear_in':
+            # For rear-in, place the entry point forward of the slot so the vehicle
+            # can reverse into it.
             ex = fx + offset_dist * math.cos(fyaw)
             ey = fy + offset_dist * math.sin(fyaw)
-        else:
-            ex = fx - offset_dist * math.cos(fyaw)
-            ey = fy - offset_dist * math.sin(fyaw)
         return ex, ey
 
     def a_star_grid(self, start, goal):
