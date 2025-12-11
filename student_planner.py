@@ -87,7 +87,7 @@ class PlannerSkeleton:
         for wall in map_payload.get("walls_rects", []) or []:
             mark_rectangle(tuple(wall))
 
-        line_thickness = max(self.cell_size * 0.5, 0.2)
+        line_thickness = max(self.cell_size * 1.0, 0.5)
         for line in map_payload.get("lines", []) or []:
             if len(line) != 4: continue
             x0, y0, x1, y1 = map(float, line)
@@ -103,6 +103,21 @@ class PlannerSkeleton:
         self.planning_mode = "APPROACH"
         self.inflate_obstacles(0)
     
+    def _update_grid_for_target(self, target):
+        def unmark_rectangle(rect: Tuple[float, float, float, float]) -> None:
+            if not self.stationary_grid: return
+            min_x, max_x, min_y, max_y = self.map_extent or (0, 0, 0, 0)
+            x0, x1 = sorted((float(rect[0]), float(rect[1])))
+            y0, y1 = sorted((float(rect[2]), float(rect[3])))
+            start_x = max(0, int((x0 - min_x) / self.cell_size))
+            end_x = min(len(self.stationary_grid[0]) - 1, int(math.ceil((x1 - min_x) / self.cell_size)))
+            start_y = max(0, int((y0 - min_y) / self.cell_size))
+            end_y = min(len(self.stationary_grid) - 1, int(math.ceil((y1 - min_y) / self.cell_size)))
+            for gy in range(start_y, end_y + 1):
+                for gx in range(start_x, end_x + 1):
+                    self.stationary_grid[gy][gx] = min(self.stationary_grid[gy][gx], 0.0)
+        unmark_rectangle(target)
+
     def normalize_angle(self, angle: float) -> float:
         while angle > math.pi: angle -= 2.0 * math.pi
         while angle < -math.pi: angle += 2.0 * math.pi
@@ -332,8 +347,8 @@ class PlannerSkeleton:
 
                     # 비용 함수
                     steer_cost = abs(steer) * 0.2
-                    switch_cost = 0.1 if current.direction != d else 0.0
-                    rev_cost = 0.1 if d == -1 else 0.0
+                    switch_cost = 0.6 if current.direction != d else 0.0
+                    rev_cost = 0.05 if d == -1 else 0.0
                     new_g = current.g + step_size + steer_cost + switch_cost + rev_cost
                     
                     # 휴리스틱 강화 (목표 지향적)
